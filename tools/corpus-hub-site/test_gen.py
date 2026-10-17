@@ -140,6 +140,12 @@ class HubV2CopyTest(unittest.TestCase):
         self.assertIn('xerj_hub_ask with {"question": "<your question>", "corpus": "lz4"}', p)
         self.assertIn(gen.CATALOGUE_URL, p)
 
+    def test_prompts_say_a_hub_tool_never_downloads(self):
+        for p in (gen.install_prompt(LANE_A), gen.category_prompt("NET", "Networking", [LANE_A])):
+            self.assertIn("never download", p)
+            self.assertIn("xerj hub pull <slug>", p)
+            self.assertNotIn("hosted hub", p)
+
     def test_domain_prompt_needs_no_corpus_name(self):
         p = gen.category_prompt("NET", "Networking", [LANE_A])
         self.assertIn('2. Ask: xerj "<your question>"\n', p)
@@ -233,6 +239,30 @@ class GeneratedSiteTest(unittest.TestCase):
         for banned in ("curl -fsSLO", "xerj corpus add", "xerj corpus index",
                        "xerj code <slug>", "xerj_code_search"):
             self.assertNotIn(banned, text)
+
+    def test_nothing_claims_a_hosted_answer_or_a_question_api(self):
+        # The CLI has no hosted client (`run_ask(.., None)`), and hub.xerj.org
+        # serves no question API (plan section 12: hosted is out of scope), so no
+        # page, prompt or the hub llms.txt may print a hosted answer or an
+        # /api/v1/ question route.
+        texts = [("llms.txt", (self.out / "llms.txt").read_text(encoding="utf-8"))]
+        texts += [(p.name, p.read_text(encoding="utf-8")) for p in sorted(self.out.rglob("*.html"))]
+        for name, text in texts:
+            for banned in ("hosted hub", "api/v1/search", "api/v1/code", "api/v1/def"):
+                self.assertNotIn(banned, text, f"{name}: {banned}")
+
+    def test_hub_llms_txt_names_every_exit_code_and_the_mcp_limits(self):
+        text = (self.out / "llms.txt").read_text(encoding="utf-8")
+        for code in ("Exit 2", "Exit 3", "Exit 4", "Exit 5", "(exit 1)"):
+            self.assertIn(code, text)
+        self.assertIn("xerj_hub_find", text)
+        self.assertIn("never downloads", text)
+        # per-client MCP registration: Claude Code line, both root keys
+        self.assertIn("claude mcp add --scope user xerj", text)
+        self.assertIn("`mcpServers`", text)
+        self.assertIn("root key `servers`", text)
+        # local corpora: the prefix the query must repeat (#1580)
+        self.assertIn("xerj search --prefix <name>", text)
 
     def test_hub_llms_txt_first_screen_has_no_long_line(self):
         # llms.txt study rule 7: no line over about 300 characters above the
