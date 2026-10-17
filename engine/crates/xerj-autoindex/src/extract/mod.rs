@@ -5,18 +5,26 @@
 pub mod bvh;
 pub mod code;
 pub mod csv_x;
+pub mod doc;
 pub mod docx;
 pub mod eml;
+pub mod epub;
 pub mod html;
+pub mod ipynb;
 pub mod json;
 pub mod jsonl;
 pub mod logs;
+pub mod man;
 pub mod mbox;
+pub(crate) mod opc;
 pub mod pdf;
+pub mod pptx;
 pub mod sqldump;
 pub mod sqlite_x;
 pub mod txt;
 pub mod unity;
+pub mod xls;
+pub mod xlsx;
 pub mod xml_x;
 pub mod yaml_x;
 
@@ -208,6 +216,33 @@ pub fn extract(
         Family::Eml => eml::extract(path, sn.gzip, sink),
         Family::Mbox => mbox::extract(path, sn.gzip, limit_bytes, sink),
         Family::Docx => docx::extract(path, sink),
+        Family::Doc => doc::extract(path, sn.logical_name.as_deref().unwrap_or(path), sink),
+        Family::Pptx => pptx::extract(path, sn.logical_name.as_deref().unwrap_or(path), sink),
+        Family::Epub => epub::extract(path, sn.logical_name.as_deref().unwrap_or(path), sink),
+        Family::Ipynb => ipynb::extract(
+            path,
+            sn.logical_name.as_deref().unwrap_or(path),
+            sn.gzip,
+            sink,
+        ),
+        Family::Man => man::extract(
+            path,
+            sn.logical_name.as_deref().unwrap_or(path),
+            sn.gzip,
+            sink,
+        ),
+        Family::Xlsx => xlsx::extract(
+            path,
+            sn.logical_name.as_deref().unwrap_or(path),
+            limit_bytes.map(|_| 500),
+            sink,
+        ),
+        Family::Xls => xls::extract(
+            path,
+            sn.logical_name.as_deref().unwrap_or(path),
+            limit_bytes.map(|_| 500),
+            sink,
+        ),
         Family::Sqlite => sqlite_x::extract(path, limit_bytes.map(|_| 500), sink),
         Family::SqlDump => sqldump::extract(path, sn.gzip, limit_bytes, sink),
         Family::Code => code::extract(path, sn, sink),
@@ -301,6 +336,126 @@ fn flatten_into(key: &str, v: Value, depth: usize, out: &mut Map<String, Value>)
             out.insert(key.to_string(), other);
         }
     }
+}
+
+/// A string field counts as prose at this many characters …
+const PASSAGE_PROSE_MIN_CHARS: usize = 24;
+/// … and this many whitespace-separated tokens. Below both, a string is an
+/// id, an enum or a date — the values that map `keyword` and leave a record
+/// invisible to passage search.
+const PASSAGE_PROSE_MIN_TOKENS: usize = 4;
+/// Cap on a synthesized passage, in characters. The passage exists so a
+/// record's own field names and values are matchable; past this size the
+/// record is prose-like and synthesis never ran anyway.
+pub const SYNTH_PASSAGE_MAX_CHARS: usize = 4 << 10;
+/// Cap per rendered value inside a synthesized passage, in characters.
+const SYNTH_PASSAGE_VALUE_CHARS: usize = 256;
+
+/// Does this record already carry a string field that reads as prose? Such a
+/// field maps `text` and the query side already searches it (`resolve_fields`
+/// includes `text` and, since rc.86, falls back to the index's own text-typed
+/// fields — `xerj-common/src/xccode/fields.rs`), so synthesizing anything
+/// would only shadow it.
+fn carries_prose(fields: &Map<String, Value>) -> bool {
+    fields.values().any(|v| {
+        v.as_str().is_some_and(|s| {
+            let t = s.trim();
+            t.chars().count() >= PASSAGE_PROSE_MIN_CHARS
+                && t.split_whitespace().count() >= PASSAGE_PROSE_MIN_TOKENS
+        })
+    })
+}
+
+/// #1158's invisible-record class, fixed at the source: a JSON record whose
+/// flattened fields carry no prose-like string is a row of ids, enums and
+/// numbers — nothing `xerj code` passage search can match, because it reads
+/// `body`/`defs`/`title`/`text` and none of them exist. Measured on the live
+/// case: `ghsa-db`, 36,263 raw advisory JSONs indexed to 193k typed records
+/// that answered `No passage matches` while the same index returned 10,000+
+/// hits over its typed fields. This synthesizes a `text` passage from the
+/// record's own fields (`key: value` lines, bounded) so the corpus is
+/// passage-searchable by default instead of only after an undocumented
+/// pre-flatten workaround.
+///
+/// Bounds and rules:
+/// - Never clobbers an existing `text` field (even a short one — the record
+///   owns that name, and its dataset already maps it).
+/// - Only runs when the record carries NO prose field: a record with real
+///   prose is already reachable through the query-side field resolution, and
+///   a rendered key/value soup would outrank that prose in the field order.
+/// - Values are capped ([`SYNTH_PASSAGE_VALUE_CHARS`]) and the passage with
+///   them ([`SYNTH_PASSAGE_MAX_CHARS`]); scalar arrays (ids, aliases) render
+///   joined so an identifier query can reach the record.
+/// - Scoped to the JSON family (whole-file and JSONL) — the measured class is
+///   raw-JSON mirrors. The same helper can ride the csv/yaml/xml Data sites
+///   if a real corpus ever needs it; until then those families are covered
+///   by the dataset-level zero-text warning instead.
+///
+/// Returns whether a passage was inserted, so the call sites' tests can pin
+/// the predicate without reading the record back out.
+pub(crate) fn ensure_text_passage(fields: &mut Map<String, Value>) -> bool {
+    if carries_prose(fields) || fields.contains_key("text") {
+        return false;
+    }
+    let mut passage = String::new();
+    for (k, v) in fields.iter() {
+        let render_value = |txt: &mut String, s: &str| {
+            // Char cap, checked in chars: a byte check would stop a multibyte
+            // passage at a third of its budget (the values that trip it are
+            // exactly the ones already capped to 256 chars, so this recount
+            // is bounded and cheap).
+            if txt.chars().count() >= SYNTH_PASSAGE_MAX_CHARS {
+                return;
+            }
+            if !txt.is_empty() {
+                txt.push('\n');
+            }
+            txt.push_str(k);
+            txt.push_str(": ");
+            let cut = s
+                .trim()
+                .chars()
+                .take(SYNTH_PASSAGE_VALUE_CHARS)
+                .collect::<String>();
+            txt.push_str(&cut);
+        };
+        match v {
+            Value::String(s) => render_value(&mut passage, s),
+            Value::Number(n) => render_value(&mut passage, &n.to_string()),
+            Value::Bool(b) => render_value(&mut passage, &b.to_string()),
+            // Scalar arrays (aliases, tags, versions) join with ", " — their
+            // identifiers are exactly what a passage exists to make matchable.
+            Value::Array(a) if a.iter().all(|e| !e.is_object() && !e.is_array()) => {
+                let joined = a
+                    .iter()
+                    .map(|e| match e {
+                        Value::String(s) => s.trim().to_string(),
+                        other => other.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                render_value(&mut passage, &joined);
+            }
+            _ => {}
+        }
+        if passage.chars().count() >= SYNTH_PASSAGE_MAX_CHARS {
+            break;
+        }
+    }
+    if passage.is_empty() {
+        return false;
+    }
+    // The per-line cap check runs before each append, so a final line can
+    // push past the bound by one line's worth. Enforce it exactly, on a
+    // char boundary (a byte slice could land mid-character: panic = abort).
+    if passage.chars().count() > SYNTH_PASSAGE_MAX_CHARS {
+        passage = passage
+            .chars()
+            .take(SYNTH_PASSAGE_MAX_CHARS)
+            .collect::<String>();
+    }
+    fields.insert("text".to_string(), Value::String(passage));
+    true
 }
 
 /// Convert a parsed YAML value into JSON (shared by the YAML and Unity
@@ -450,7 +605,12 @@ pub fn for_each_section(text: &str, emit: &mut dyn FnMut(String) -> bool) -> boo
     let mut cur = String::new();
 
     for para in text.split("\n\n") {
-        if !cur.is_empty() && cur.len() + para.len() > SECTION_CHARS {
+        // `cur.len() > SECTION_OVERLAP`: a shorter section would be carried
+        // WHOLE into the next as its overlap, so emitting it adds a record
+        // with no text of its own (a heading before a long first paragraph).
+        // It stays in `cur` and leads the next section instead.
+        if !cur.is_empty() && cur.len() + para.len() > SECTION_CHARS && cur.len() > SECTION_OVERLAP
+        {
             let done = std::mem::take(&mut cur);
             let carry = tail(&done, SECTION_OVERLAP);
             if !emit(done) {
@@ -707,6 +867,43 @@ mod section_tests {
         }
     }
 
+    /// A short paragraph (a heading) followed by one too big to join it was
+    /// emitted as a section of its own, and the next section then repeated it
+    /// whole as its overlap: a record with no text of its own. Seen as
+    /// "CHAPTER 26. Knights and Squires." alone on a Gutenberg EPUB.
+    #[test]
+    fn a_section_the_next_would_repeat_whole_is_not_emitted() {
+        // Each ~2100 bytes: too big to join the heading in one section.
+        let long = |i: usize| format!("w{i} ").repeat(700);
+        let t = format!(
+            "CHAPTER 26. Knights and Squires.\n\n{}\n\n{}\n\n{}",
+            long(1),
+            long(2),
+            long(3)
+        );
+        let secs = split_sections(&t);
+        assert!(
+            secs[0].starts_with("CHAPTER 26.") && secs[0].contains("w1 w1"),
+            "the heading leads a real section: {:?}",
+            &secs[0][..secs[0].len().min(60)]
+        );
+        for w in secs.windows(2) {
+            assert!(
+                !w[1].starts_with(w[0].as_str()),
+                "a section repeated whole by its successor: {:?}",
+                w[0]
+            );
+        }
+        let short = format!("{}\n\nCHAPTER 26.", "y".repeat(SECTION_CHARS));
+        assert!(
+            split_sections(&short)
+                .last()
+                .unwrap()
+                .contains("CHAPTER 26."),
+            "a short LAST paragraph is still emitted"
+        );
+    }
+
     /// A single paragraph larger than two sections must still be bounded.
     #[test]
     fn pathological_single_paragraph_is_hard_split() {
@@ -718,7 +915,8 @@ mod section_tests {
         }
     }
 
-    /// The pre-#239 implementation, kept verbatim as an oracle. It is quadratic
+    /// The pre-#239 implementation, kept as an oracle (verbatim but for the
+    /// redundant-section rule, changed in both in step). It is quadratic
     /// — only ever call it on inputs of a few hundred KB.
     fn legacy_split_sections(text: &str) -> Vec<String> {
         if text.len() <= SECTION_CHARS {
@@ -727,7 +925,13 @@ mod section_tests {
         let mut out: Vec<String> = Vec::new();
         let mut cur = String::new();
         for para in text.split("\n\n") {
-            if !cur.is_empty() && cur.len() + para.len() > SECTION_CHARS {
+            // The one deliberate change since #239, mirrored from
+            // `for_each_section`: a section its successor would repeat whole
+            // is not emitted.
+            if !cur.is_empty()
+                && cur.len() + para.len() > SECTION_CHARS
+                && cur.len() > SECTION_OVERLAP
+            {
                 let done = std::mem::take(&mut cur);
                 let carry = tail(&done, SECTION_OVERLAP);
                 out.push(done);
@@ -774,6 +978,12 @@ mod section_tests {
             doc(200, 400),
             doc(60, 300),
             doc(3, 9000),
+            // A short paragraph before ones too big to join it, at the
+            // overlap boundary and one byte either side.
+            format!("{}\n\n{}", "h".repeat(32), doc(4, 2100)),
+            format!("{}\n\n{}", "h".repeat(SECTION_OVERLAP - 1), doc(4, 2100)),
+            format!("{}\n\n{}", "h".repeat(SECTION_OVERLAP), doc(4, 2100)),
+            format!("{}\n\n{}", "h".repeat(SECTION_OVERLAP + 1), doc(4, 2100)),
             // Multi-byte, with the cut landing inside a char: 3-byte and 4-byte
             // sequences do not divide SECTION_CHARS evenly.
             "é".repeat(4 * SECTION_CHARS),

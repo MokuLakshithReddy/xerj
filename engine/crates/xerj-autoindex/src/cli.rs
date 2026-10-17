@@ -79,9 +79,18 @@ pub struct IndexCfg {
     /// `.gitignore` / `.xerjignore` / built-in build-output rules (#276).
     /// `deep_count` is set from `--dry-run`.
     pub ignore: IgnoreOptions,
-    pub max_file_gb: u64,
+    /// Whole-file size cap in BYTES for non-streaming families (JSON, HTML,
+    /// prose, PDF, …). Streaming families are never capped. Set on the CLI by
+    /// any one of `--max-file-gb` / `--max-file-mb` / `--max-file-bytes`
+    /// (mutually exclusive), all normalised to bytes here so a sub-GB cap —
+    /// e.g. a 10 MB source-watcher budget (#1233) — is expressible. Default
+    /// 2 GB.
+    pub max_file_bytes: u64,
     pub sample: usize,
     pub no_semantic: bool,
+    /// `--code-analyzer` (#1198): `code` declares the built-in identifier-aware
+    /// analyzer on newly created datasets that hold source code.
+    pub code_analyzer: crate::infer::CodeAnalyzer,
     /// Second-brain name; None derives it from the root folder basename.
     pub brain: Option<String>,
     /// Disable edge detection entirely (no `.xerj-memory-*-edges` writes).
@@ -117,7 +126,9 @@ pub struct IndexCfg {
 pub struct MapCfg {
     pub url: String,
     pub api_key: Option<String>,
-    pub prefix: String,
+    /// Explicit `--prefix` filter (`None` when the user did not pass `--prefix`,
+    /// preserving the #971 multi-corpus view on a bare `autoindex map`).
+    pub prefix: Option<String>,
     pub json: bool,
     pub dataset: Option<String>,
     /// A startup note when `XERJ_URL` was set but ignored (endpoint comes from
@@ -291,9 +302,21 @@ pub fn help_text_with(feedback: bool) -> String {
                                   not an ignore rule, it is what keeps secrets out.\n\
              --no-default-ignores keep the ignore files, drop only the built-in list\n\
                                   ({defaults})\n\
-             --max-file-gb <N>    skip+record oversized non-streamable files (default 2)\n\
+             --max-file-gb <N>    skip+record oversized non-streamable files, cap in whole\n\
+                                  GB (default 2). Use --max-file-mb/--max-file-bytes for a\n\
+                                  smaller cap; the three are mutually exclusive\n\
+             --max-file-mb <N>    same cap expressed in whole MB (e.g. 10 for a source\n\
+                                  watcher); mutually exclusive with --max-file-gb/-bytes\n\
+             --max-file-bytes <N> same cap expressed in whole bytes; mutually exclusive\n\
+                                  with --max-file-gb/--max-file-mb\n\
              --sample <N>         records sampled per file for inference (default 500)\n\
              --no-semantic        skip semantic_text on body fields (pure BM25+keyword)\n\
+             --code-analyzer <A>  standard (default) or code: `code` declares the built-in\n\
+                                  identifier-aware analyzer (splits snake_case/camelCase,\n\
+                                  keeps the original token) on NEWLY created datasets\n\
+                                  holding source code; existing indexes keep theirs.\n\
+                                  Measured +0.11 file-localization acc@5 (#1198); costs\n\
+                                  ~15% index size and ~2.4x text-analysis time\n\
              --brain <NAME>       second-brain name; relationship edges land in\n\
                                   .xerj-memory-<NAME>-edges (default: folder name slug)\n\
              --no-graph           skip relationship detection (wikilinks, local links,\n\
@@ -478,8 +501,9 @@ pub fn help_text_with(feedback: bool) -> String {
                --no-graph path:      walk, hash, scan, prepare (install mappings),\n\
                  snapshot (seal + extract, bytes), index (sealed bulk bytes, the\n\
                  in-flight file named), finalize-catalog, finalize-refresh (one\n\
-                 refresh per dataset), finalize-verify (one read-back per\n\
-                 file). A resumed run starts at `replay` and its `index` phase\n\
+                 refresh per dataset), finalize-verify (read-backs batched\n\
+                 into per-index digest windows, one search per window). A\n\
+                 resumed run starts at `replay` and its `index` phase\n\
                  counts only the operations still to apply.\n\
          \n\
          ESTIMATE + DECISION GATE:\n\
@@ -627,6 +651,34 @@ pub(crate) fn xerj_url_ignored_note(xerj_url: Option<&str>, url_explicit: bool) 
     ))
 }
 
+/// Normalise one of the mutually-exclusive `--max-file-{gb,mb,bytes}` flags
+/// into the shared byte cap (#1233). `unit` is bytes-per-unit (1<<30 for GB,
+/// 1<<20 for MB, 1 for bytes). The flags are mutually exclusive: a second one
+/// is a hard usage error, not last-wins, so a resumed generation can never
+/// disagree with itself about the cap. Parsing as `u64` rejects negatives and
+/// non-numbers with the actionable exit-2 error the reporter saw; the multiply
+/// is overflow-checked.
+fn set_max_file_bytes(
+    slot: &mut Option<u64>,
+    flag: &str,
+    raw: Option<String>,
+    unit: u64,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(
+            "specify only one of --max-file-gb / --max-file-mb / --max-file-bytes".to_owned(),
+        );
+    }
+    let n: u64 = raw
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("{flag} needs a non-negative integer"))?;
+    let bytes = n
+        .checked_mul(unit)
+        .ok_or_else(|| format!("{flag} value is too large"))?;
+    *slot = Some(bytes);
+    Ok(())
+}
+
 pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut it = args.into_iter().peekable();
     let mut folder: Option<PathBuf> = None;
@@ -654,6 +706,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut snapshot_max_bytes = 64u64 << 30;
     let mut bulk_timeout_explicit = false;
     let mut prefix = "ax".to_string();
+    let mut prefix_explicit = false;
     let mut state_dir: Option<PathBuf> = None;
     let mut endpoint_url: Option<String> = None;
     let mut endpoint_explicit = false;
@@ -663,9 +716,13 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut stub_globs: Vec<String> = Vec::new();
     let mut no_ignore = false;
     let mut no_default_ignores = false;
-    let mut max_file_gb = 2u64;
+    // One of --max-file-gb / --max-file-mb / --max-file-bytes sets this, all
+    // normalised to bytes; `None` until one is seen so a second size flag is a
+    // hard error and the default (2 GB) applies only when none is given (#1233).
+    let mut max_file_bytes: Option<u64> = None;
     let mut sample = 500usize;
     let mut no_semantic = false;
+    let mut code_analyzer = crate::infer::CodeAnalyzer::default();
     let mut brain: Option<String> = None;
     let mut no_graph = false;
     let mut watch = false;
@@ -778,7 +835,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--in-flight" => {
                 let _ = it.next(); // reserved (bulks are worker-synchronous in v1)
             }
-            "--prefix" => prefix = it.next().ok_or("--prefix needs a value")?,
+            "--prefix" => {
+                prefix = it.next().ok_or("--prefix needs a value")?;
+                prefix_explicit = true;
+            }
             "--state-dir" => state_dir = it.next().map(PathBuf::from),
             "--endpoint-url" => {
                 let value = it.next().ok_or(
@@ -811,10 +871,13 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--no-ignore" => no_ignore = true,
             "--no-default-ignores" => no_default_ignores = true,
             "--max-file-gb" => {
-                max_file_gb = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("--max-file-gb needs a number")?
+                set_max_file_bytes(&mut max_file_bytes, "--max-file-gb", it.next(), 1u64 << 30)?
+            }
+            "--max-file-mb" => {
+                set_max_file_bytes(&mut max_file_bytes, "--max-file-mb", it.next(), 1u64 << 20)?
+            }
+            "--max-file-bytes" => {
+                set_max_file_bytes(&mut max_file_bytes, "--max-file-bytes", it.next(), 1)?
             }
             "--sample" => {
                 sample = it
@@ -898,6 +961,12 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--dry-run" => dry_run = true,
             "--json" => json = true,
             "--md" => json = false,
+            "--code-analyzer" => {
+                let raw = it
+                    .next()
+                    .ok_or("--code-analyzer needs a value: standard or code")?;
+                code_analyzer = crate::infer::CodeAnalyzer::parse(&raw)?;
+            }
             "--progress" => {
                 let raw = it
                     .next()
@@ -918,7 +987,12 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 progress_interval = Some(Duration::from_secs(secs));
             }
             "--quiet" => quiet = true,
-            "--dataset" => dataset = it.next(),
+            "--dataset" => {
+                dataset =
+                    Some(it.next().ok_or(
+                        "--dataset needs a dataset slug: `autoindex map --dataset <SLUG>`",
+                    )?);
+            }
             "--poll-interval" => {
                 watch_flags_used.push("--poll-interval");
                 let secs: u64 = it
@@ -1234,16 +1308,42 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     // `all_four_routes_through_the_positional_argument_stay_open` in this
     // file's tests is the guard. It is one test on purpose: three separate
     // ones would each keep passing while a merge broke the other two.
+    let used_watch_flags = || {
+        let mut u = watch_flags_used.clone();
+        u.sort_unstable();
+        u.dedup();
+        u.join(" ")
+    };
     if !watch && !watch_flags_used.is_empty() {
-        let used = {
-            let mut u = watch_flags_used.clone();
-            u.sort_unstable();
-            u.dedup();
-            u.join(" ")
-        };
+        let used = used_watch_flags();
         return Err(format!(
             "{used} only apply to a watch. Add --watch, or drop them"
         ));
+    }
+    // These flags configure the object-storage poll (`WatchCfg`); the folder
+    // watcher (#967) has no field for any of them, so accepting them on a
+    // folder root was the accept-and-ignore class (#279): `<folder> --watch
+    // --no-graph --once` committed a generation and then kept watching. A
+    // subcommand, or a missing root, keeps the refusal its own route gives.
+    if watch
+        && !watch_flags_used.is_empty()
+        && sub.is_none()
+        && root_raw.is_some()
+        && !root_is_object_url
+    {
+        let used = used_watch_flags();
+        return Err(format!(
+            "{used} configure an object-storage watch (`s3://…` or `r2://…` with --watch); a \
+             folder --watch reindexes on change until it is stopped, and its only knob is \
+             --debounce. Drop them"
+        ));
+    }
+    if watch && root_is_object_url && debounce_ms.is_some() {
+        return Err(
+            "--debounce is the folder watcher's quiet period; an object-storage watch polls on \
+             a schedule instead. Use --poll-interval"
+                .into(),
+        );
     }
     // `--watch` on a LOCAL root is #967's live-reindexing route, which landed
     // on main while this branch was open. This is where the branch used to
@@ -1304,6 +1404,16 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             return Err(
                 "--label labels documents at ingest time; an object-storage watch indexes nothing \
                  and never reads document bytes. Drop --label"
+                    .into(),
+            );
+        }
+        if dataset.is_some() {
+            // #1231: same accept-and-ignore class — --dataset only selects which
+            // dataset `autoindex map` prints and has no meaning for a watch.
+            return Err(
+                "--dataset selects a single dataset to show and is only supported with `autoindex \
+                 map`; an object-storage watch produces a change feed and reads no catalog. Drop \
+                 --dataset"
                     .into(),
             );
         }
@@ -1398,11 +1508,24 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
         (Some("map"), _) => Ok(Cmd::Map(MapCfg {
             url,
             api_key,
-            prefix,
+            prefix: prefix_explicit.then_some(prefix),
             json,
             dataset,
             xerj_url_note,
         })),
+        // #1231: --dataset only selects which dataset `autoindex map` prints;
+        // it is NOT an indexing destination filter. Accepting it on the
+        // indexing/status routes and then dropping it is the silent no-op this
+        // repo refuses (#204, #279): the operator reads it as an explicit
+        // destination restriction and gets an unrestricted run instead. Only
+        // `map` reaches here with dataset still unconsumed.
+        (_, _) if dataset.is_some() => Err(format!(
+            "--dataset selects a single dataset to show and is only supported with \
+             `autoindex map`, not `autoindex {}`: it does not restrict where indexing \
+             writes. To inspect one dataset run `autoindex map --dataset <SLUG>`; to \
+             index, drop --dataset",
+            sub.as_deref().unwrap_or("<root>")
+        )),
         (Some("status"), _) if bulk_timeout_explicit => {
             Err("--bulk-timeout-secs applies only to indexing, not `autoindex status`".into())
         }
@@ -1464,9 +1587,10 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                     // directory; a real run's whole point is not touching it.
                     deep_count: dry_run,
                 },
-                max_file_gb,
+                max_file_bytes: max_file_bytes.unwrap_or(2u64 << 30),
                 sample: sample.max(50),
                 no_semantic,
+                code_analyzer,
                 brain,
                 no_graph,
                 dry_run,
@@ -1748,6 +1872,41 @@ mod tests {
         assert!(err(&["s3://logs/", "--watch", "--endpoint-url", "ftp://x"]).contains("http://"));
     }
 
+    /// Each watch route takes only the flags it reads. The object poll's knobs
+    /// have no field on the folder watcher, and `--debounce` has none on the
+    /// poll, so either one on the wrong route is refused rather than accepted
+    /// and ignored (#279). Before this, `data --watch --no-graph --once`
+    /// indexed once and then kept watching until it was killed.
+    #[test]
+    fn watch_flags_are_refused_on_the_route_that_cannot_read_them() {
+        for flags in [
+            &["--once"][..],
+            &["--max-cycles", "3"],
+            &["--poll-interval", "60"],
+            &["--events-out", "events.jsonl"],
+            &["--status-file", "status.json"],
+            &["--no-fetch"],
+        ] {
+            let mut args = vec!["data", "--watch", "--no-graph"];
+            args.extend_from_slice(flags);
+            let e = err(&args);
+            assert!(e.contains(flags[0]), "{flags:?}: {e}");
+            assert!(e.contains("object-storage watch"), "{flags:?}: {e}");
+        }
+        let e = err(&["s3://logs/", "--watch", "--debounce", "500"]);
+        assert!(e.contains("--poll-interval"), "{e}");
+
+        // The flags still reach the route that reads them.
+        assert_eq!(
+            watch(&["s3://logs/", "--watch", "--once"]).max_cycles,
+            Some(1)
+        );
+        let local = index(&["data", "--watch", "--no-graph", "--debounce", "500"]);
+        assert_eq!(local.debounce, std::time::Duration::from_millis(500));
+        // And without --watch, the existing refusal still names --watch.
+        assert!(err(&["data", "--once"]).contains("Add --watch"));
+    }
+
     #[test]
     fn contradictory_and_out_of_range_watch_flags_are_refused() {
         assert!(err(&["s3://b/", "--watch", "--once", "--max-cycles", "3"]).contains("contradict"));
@@ -1922,6 +2081,50 @@ mod tests {
         }
     }
 
+    /// #1233: the whole-file cap must be expressible below 1 GB. `--max-file-gb`
+    /// stays the whole-GB flag (default 2 GB), and `--max-file-mb` /
+    /// `--max-file-bytes` reach the sub-GB range a source watcher needs. All
+    /// three normalise to the same `max_file_bytes`.
+    #[test]
+    fn max_file_cap_defaults_to_2gb_and_accepts_mb_and_bytes() {
+        assert_eq!(index(&["data"]).max_file_bytes, 2u64 << 30);
+        assert_eq!(
+            index(&["data", "--max-file-gb", "5"]).max_file_bytes,
+            5u64 << 30
+        );
+        // The exact case the reporter could not express: a 10 MB source budget.
+        assert_eq!(
+            index(&["data", "--max-file-mb", "10"]).max_file_bytes,
+            10u64 << 20
+        );
+        assert_eq!(
+            index(&["data", "--max-file-bytes", "4096"]).max_file_bytes,
+            4096
+        );
+    }
+
+    /// Malformed, negative and overflowing values are refused with an
+    /// actionable usage error (#1233); the three size flags are mutually
+    /// exclusive so a resumed generation can never disagree with itself.
+    #[test]
+    fn max_file_cap_rejects_bad_values_and_double_specification() {
+        // Non-numeric and negative both fail the u64 parse with the actionable
+        // message (negatives are the exit-2 the reporter saw, kept actionable).
+        assert!(err(&["data", "--max-file-mb", "ten"])
+            .contains("--max-file-mb needs a non-negative integer"));
+        assert!(err(&["data", "--max-file-gb", "-1"])
+            .contains("--max-file-gb needs a non-negative integer"));
+        assert!(
+            err(&["data", "--max-file-gb"]).contains("--max-file-gb needs a non-negative integer")
+        );
+        // Overflow of the unit multiply is caught, not wrapped.
+        assert!(err(&["data", "--max-file-gb", "18446744073709551615"])
+            .contains("--max-file-gb value is too large"));
+        // Mutually exclusive: a second size flag is a hard error, not last-wins.
+        assert!(err(&["data", "--max-file-gb", "1", "--max-file-mb", "10"])
+            .contains("specify only one of --max-file-gb / --max-file-mb / --max-file-bytes"));
+    }
+
     #[test]
     fn fresh_help_scopes_the_refusal_and_denies_being_cleanup() {
         let help = super::FRESH_HELP;
@@ -2094,6 +2297,33 @@ mod tests {
             index(&["data", "--max-minutes", "10080"]).max_minutes,
             10080
         );
+    }
+
+    /// #1198: `--code-analyzer` defaults to `standard`, takes `code`, and
+    /// refuses anything else by name instead of silently falling back.
+    #[test]
+    fn code_analyzer_flag_parses_and_refuses_unknown_values() {
+        assert_eq!(
+            index(&["data"]).code_analyzer,
+            crate::infer::CodeAnalyzer::Standard
+        );
+        assert_eq!(
+            index(&["data", "--code-analyzer", "code"]).code_analyzer,
+            crate::infer::CodeAnalyzer::Code
+        );
+        assert_eq!(
+            index(&["data", "--code-analyzer", "standard"]).code_analyzer,
+            crate::infer::CodeAnalyzer::Standard
+        );
+        for args in [
+            vec!["data", "--code-analyzer"],
+            vec!["data", "--code-analyzer", "stemmer"],
+        ] {
+            let rendered = args.join(" ");
+            let err = parse(args.into_iter().map(str::to_string).collect())
+                .expect_err(&format!("`{rendered}` must be refused"));
+            assert!(err.contains("--code-analyzer"), "{err}");
+        }
     }
 
     /// `--approve fast` is an instruction, not a label: the run must really
@@ -2662,5 +2892,86 @@ mod tests {
             Some("from-env"),
             "the environment is also never overwritten by discovery"
         );
+    }
+
+    /// #1231: `--dataset` only picks which dataset `autoindex map` prints. On
+    /// the indexing and status routes it used to parse and then be dropped, so
+    /// `autoindex <root> ... --dataset repository-docs` read like an explicit
+    /// destination restriction and silently ran an unrestricted pass instead.
+    /// It must be refused there, naming the flag and the only command it works
+    /// with — and existence of the slug cannot matter, or a nonexistent one
+    /// would still start indexing.
+    #[test]
+    fn dataset_is_refused_on_indexing_and_status_but_kept_for_map() {
+        // The report's two invocations: the second only differs by --dataset,
+        // and an existing slug and a made-up one must both be refused the same
+        // way, since neither may start an indexing pass.
+        for slug in ["repository-docs", "no-such-dataset-xyz"] {
+            let text = err(&[
+                "/path/to/root",
+                "--no-graph",
+                "--no-semantic",
+                "--yes",
+                "--prefix",
+                "example",
+                "--dataset",
+                slug,
+            ]);
+            assert!(
+                text.contains("--dataset") && text.contains("autoindex map"),
+                "the refusal must name the flag and the command it belongs to: {text}"
+            );
+            assert!(
+                text.contains("does not restrict where indexing writes"),
+                "the message must correct the destination-restriction misread: {text}"
+            );
+        }
+
+        // Status reads a node and never indexes, so --dataset is equally inapt.
+        let text = err(&["status", "--dataset", "repository-docs"]);
+        assert!(
+            text.contains("--dataset") && text.contains("autoindex status"),
+            "status must refuse --dataset and name itself: {text}"
+        );
+
+        // The one route it is valid on still carries the selection through.
+        match parse(
+            ["map", "--dataset", "repository-docs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .expect("map --dataset must parse")
+        {
+            Cmd::Map(cfg) => assert_eq!(cfg.dataset.as_deref(), Some("repository-docs")),
+            other => panic!("expected a map config, got {other:?}"),
+        }
+
+        // And a bare --dataset with no slug is a usage error, not a silent all.
+        let text = err(&["map", "--dataset"]);
+        assert!(
+            text.contains("--dataset needs a dataset slug"),
+            "a valueless --dataset must be refused: {text}"
+        );
+    }
+
+    #[test]
+    fn map_records_explicit_prefix_and_leaves_unscoped_map_none() {
+        match parse(["map"].iter().map(|s| s.to_string()).collect()).expect("bare map must parse") {
+            Cmd::Map(cfg) => assert_eq!(cfg.prefix, None),
+            other => panic!("expected a map config, got {other:?}"),
+        }
+
+        match parse(
+            ["map", "--prefix", "xc-tantivy"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .expect("map --prefix must parse")
+        {
+            Cmd::Map(cfg) => assert_eq!(cfg.prefix.as_deref(), Some("xc-tantivy")),
+            other => panic!("expected a map config, got {other:?}"),
+        }
     }
 }

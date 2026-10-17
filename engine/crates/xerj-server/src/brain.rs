@@ -160,8 +160,10 @@ fn parse(args: Vec<String>) -> Result<Option<BrainCfg>, String> {
 }
 
 fn default_data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    Path::new(&home).join(".xerj").join("brain")
+    xerj_common::home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".xerj")
+        .join("brain")
 }
 
 /// (host, port) out of an `http://host[:port]` URL. Only plain-http local
@@ -624,9 +626,10 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         // rather than inventing its own: build output does not belong in a
         // second brain either (#276).
         ignore: xerj_autoindex::ignore_rules::IgnoreOptions::default(),
-        max_file_gb: 2,
+        max_file_bytes: 2 << 30,
         sample: 500,
         no_semantic: false,
+        code_analyzer: Default::default(),
         brain: Some(brain.to_string()),
         no_graph: false,
         dry_run: false,

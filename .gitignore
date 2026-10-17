@@ -110,6 +110,7 @@ landing/resources/xerj-sales-kit.zip
 # Re-include root OSS scaffolding so the default *.md / no-extension
 # ignore above does not swallow the standard public-repo files.
 !README.md
+!/README.zh-CN.md
 !CLA.md
 !LICENSE
 !LICENSE.md
@@ -141,8 +142,6 @@ landing/resources/xerj-sales-kit.zip
 
 # Transient demo-capture artifacts (local paths + ephemeral tokens)
 demo/screenshots/manifest.json
-demo/.flow-data/
-demo/.flow-chrome/
 
 # Local ES 8.13.4 reference node for fair benchmarking (never committed)
 .es-local/

@@ -122,7 +122,10 @@
   <a href="/docs/">DOCS</a>
   <a href="/docs/recipes/">RECIPES</a>
   <a href="/playground">DASHBOARDS</a>
+  <a href="https://hub.xerj.org" rel="external">HUB</a>
   <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <a href="https://x.com/xerj_org" rel="external" title="XERJ on X" style="display:inline-flex;align-items:center"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg></a>
+  <a href="https://discord.com/invite/yetXFusXfs" rel="external" title="XERJ on Discord" style="display:inline-flex;align-items:center"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.317 4.37a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.037A19.74 19.74 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 00-.041-.106 13.1 13.1 0 01-1.872-.892.077.077 0 01-.008-.128 10.2 10.2 0 00.372-.292.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.01c.12.098.246.198.373.292a.077.077 0 01-.006.127 12.3 12.3 0 01-1.873.892.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.84 19.84 0 006.002-3.03.077.077 0 00.032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg></a>
   <span class="theme"><button type="button" data-theme="day" class="active">DAY</button><span class="dash">·</span><button type="button" data-theme="night">NIGHT</button></span>
 </nav>
 
@@ -130,7 +133,7 @@
 <div class="uc-hero">
   <p class="blog-crumb"><a href="/blog/">&larr; ALL POSTS · /BLOG</a></p>
   <div class="uc-eyebrow">RELEASE GATES · TEN FEATURES · EIGHT GATES · RUNS 2026-09-30</div>
-  <h1>THE RC.80 GATES.<br><span class="accent">MEASURED IN PUBLIC, LOSSES LEFT IN.</span></h1>
+  <h1>THE RC.81 GATES.<br><span class="accent">MEASURED IN PUBLIC, LOSSES LEFT IN.</span></h1>
   <p class="blog-byline">AUTHOR · XERJ ENGINEERING TEAM · PUBLISHED · 2026-09-30</p>
 
   <!-- The verdict, first. Every figure below is verbatim from the gate runs
@@ -139,7 +142,7 @@
   <section class="verdict-panel" id="verdict">
     <div class="vh"><span class="wn">THE VERDICT</span>
       <span class="wm">split, measured, with the losses left in</span></div>
-    <p>The program behind rc.80 shipped ten features, and every item that could carry a number was filed with a measured gate that binds at ship time. This post is the packaging half of that rule, and the scoreboard is a split. <strong>Three gates passed outright</strong>: <code class="inline">/_ask</code> turned 230 prompt/gold pairs into validated DSL at macro-F1 <strong>0.9975</strong> with zero invalid queries and wall-clock p50 <strong>1.129 ms</strong> against a 300 ms budget; <code class="inline">xerj_map</code> took unknown-field 400s on MCP-shaped DSL from <strong>20/30 guessed to 0/30 map-informed</strong> &mdash; a 100% reduction against a &ge;80% bar; and the calibration layer took FiQA rerank ECE from <strong>0.3109 raw to 0.0088 held-out</strong> against a &le;0.10 bar. <strong>Three failed with the numbers</strong>: the local judge loses to its own first stage everywhere it was measured (SciFact <strong>0.7045 &rarr; 0.5967</strong>), the decision flywheel answers <strong>19.72%</strong> of later traffic at &ge;0.8 confidence against an 80% bar, and the tier-2 decide head misses its accuracy bars by 3 to 59 points. <strong>One split</strong>: stemming gained +0.0160/+0.0179 BM25 nDCG@10 (bar +0.01) and still left 15 zero-hit queries against a bar of &le;10 &mdash; and no stemmer can fix the 15. The failures filed four issues, <strong>#1091&ndash;#1094</strong>. No number below was tuned after its gate was read.</p>
+    <p>The program behind rc.81 shipped ten features, and every item that could carry a number was filed with a measured gate that binds at ship time. This post is the packaging half of that rule, and the scoreboard is a split. <strong>Three gates passed outright</strong>: <code class="inline">/_ask</code> turned 230 prompt/gold pairs into validated DSL at macro-F1 <strong>0.9975</strong> with zero invalid queries and wall-clock p50 <strong>1.129 ms</strong> against a 300 ms budget; <code class="inline">xerj_map</code> took unknown-field 400s on MCP-shaped DSL from <strong>20/30 guessed to 0/30 map-informed</strong> &mdash; a 100% reduction against a &ge;80% bar; and the calibration layer took FiQA rerank ECE from <strong>0.3109 raw to 0.0088 held-out</strong> against a &le;0.10 bar. <strong>Three failed with the numbers</strong>: the local judge loses to its own first stage everywhere it was measured (SciFact <strong>0.7045 &rarr; 0.5967</strong>), the decision flywheel answers <strong>19.72%</strong> of later traffic at &ge;0.8 confidence against an 80% bar, and the tier-2 decide head misses its accuracy bars by 3 to 59 points. <strong>One split</strong>: stemming gained +0.0160/+0.0179 BM25 nDCG@10 (bar +0.01) and still left 15 zero-hit queries against a bar of &le;10 &mdash; and no stemmer can fix the 15. The failures filed four issues, <strong>#1091&ndash;#1094</strong>. No number below was tuned after its gate was read.</p>
   </section>
 
   <p class="uc-lead">One window, ten features, eight gates, all measured on 2026-09-30 against bars that were written down before the work started. The wins and the losses sit in the same tables, every figure links to the run that produced it, and the four defects the gates exposed are filed in the open tracker with the measurements that found them. That is the whole post.</p>
@@ -162,7 +165,7 @@
 <section class="scene-section" id="program">
   <div class="kicker"><span class="accent">01</span><span class="dash">·</span><span>THE PROGRAM · TEN FEATURES, EACH WITH A GATE THAT BINDS</span></div>
   <h2 class="scene" style="font-size:var(--fs-56);">THE RULE WAS WRITTEN<br><span class="accent">BEFORE THE WORK.</span></h2>
-  <p class="wide">The ten-item program to the first official release (<a href="https://github.com/xerj-org/xerj/discussions/1054" rel="external">discussion #1054</a>, filed as issues <a href="https://github.com/xerj-org/xerj/issues/1055" rel="external">#1055</a>&ndash;<a href="https://github.com/xerj-org/xerj/issues/1064" rel="external">#1064</a>) was planned as five items for rc.79, four for rc.80, and the open model for v1.1.0. They landed together in one window &mdash; PRs #1066&ndash;#1090 since the rc.78 cut &mdash; so the gates were run as one suite, and the artifacts call it the rc.80 gate suite. This post keeps that name and states the plan honestly: two planned releases, one measured window.</p>
+  <p class="wide">The ten-item program to the first official release (<a href="https://github.com/xerj-org/xerj/discussions/1054" rel="external">discussion #1054</a>, filed as issues <a href="https://github.com/xerj-org/xerj/issues/1055" rel="external">#1055</a>&ndash;<a href="https://github.com/xerj-org/xerj/issues/1064" rel="external">#1064</a>) was planned as five items for rc.79, four for rc.81, and the open model for v1.1.0. They landed together in one window &mdash; PRs #1066&ndash;#1090 since the rc.78 cut &mdash; so the gates were run as one suite, and the artifacts call it the rc.81 gate suite. This post keeps that name and states the plan honestly: two planned releases, one measured window.</p>
 
   <p class="wide">The plan's own packaging rule, verbatim: <em>a <code class="inline">benchmarks/&lt;name&gt;</code> directory with raw results plus a blog post with the losses left in.</em> Three items also carried a loses-does-not-ship rule in their issue text &mdash; the local judge must beat the shipped hybrid arm beyond the run spread or it does not ship; the decide head below its bar ships behind a flag with the numbers published; the FiQA judge row must clear 0.30. This post is where those rules get honoured.</p>
 
@@ -196,7 +199,7 @@
 
   <ul class="deep">
     <li><strong>Two rows say "not measured" on purpose.</strong> <code class="inline">max_tokens</code> is a response-size budget with no quality claim attached, and the <code class="inline">_watcher</code> detection gate (wrong-and-confident rate at p&ge;0.8) has not been run &mdash; the watcher's mechanics are test-pinned, its detection-quality number is not, and this post does not invent one.</li>
-    <li><strong>One binary, one day.</strong> Every number in this post was measured on 2026-09-30 on release builds of main @ <code class="inline">a179e1ef3</code>, version string <code class="inline">v1.0.0-rc.78</code> &mdash; the rc.79/rc.80 tags are cut after the gates, not before them. The two exceptions are stated where they occur (the tier-2 feature build, the paid provider arm).</li>
+    <li><strong>One binary, one day.</strong> Every number in this post was measured on 2026-09-30 on release builds of main @ <code class="inline">a179e1ef3</code>, version string <code class="inline">v1.0.0-rc.78</code> &mdash; the rc.79/rc.81 tags are cut after the gates, not before them. The two exceptions are stated where they occur (the tier-2 feature build, the paid provider arm).</li>
   </ul>
   <p class="src">The plan: <a href="https://github.com/xerj-org/xerj/discussions/1054" rel="external">discussion #1054</a> ·
     tracker <a href="https://github.com/xerj-org/xerj/issues/1065" rel="external">#1065</a> ·
@@ -379,7 +382,7 @@
 </nav>
 <!-- seo:footer-end -->
 <footer class="footer">
-  <span>XERJ.AI · V1.0.0-RC.80 · 2026</span>
+  <span>XERJ.AI · V1.0.0-RC.96 · 2026</span>
   <span>SEARCH FOR THE AGENT ERA</span>
   <span><a href="/product">PRODUCT</a> · <a href="/docs/">DOCS</a> · <a href="/brand">BRAND</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>

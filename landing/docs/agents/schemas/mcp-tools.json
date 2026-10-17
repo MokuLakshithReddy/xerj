@@ -604,6 +604,90 @@
           "prompt"
         ]
       }
+    },
+    {
+      "name": "xerj_hub_find",
+      "description": "Discover which hub corpora can answer a question. Returns candidate corpora with their pin, licence and whether the pack is already on this machine — not passages; ask one with xerj_hub_ask. Routed exactly as `xerj ask` routes: your project's dependencies, the signed catalogue's term sketches, and the exact symbol a definition question names (offline: reads the catalogue `xerj hub sync` cached and never fetches it; this build has no hosted search). Excluded-licence corpora are never listed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "What the agent is working on; a corpus name is never required here."
+          },
+          "k": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "description": "Max candidate corpora to return (default 5, at most 10)."
+          }
+        },
+        "required": [
+          "question"
+        ]
+      }
+    },
+    {
+      "name": "xerj_hub_def",
+      "description": "Look up one definition in a named hub corpus: its kind, signature, file:line, and the literal value for a const/macro/define. Returns an Answer in def mode (no passages). Same as `xerj ask --corpus <slug> --def <SYMBOL>`: answered from the local pack; a corpus not on this machine is never downloaded by this tool — the answer says which `xerj hub pull` line fetches it. Approach-only corpora carry a read-do-not-copy warning on every hit.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "slug": {
+            "type": "string",
+            "description": "Corpus slug to resolve the symbol in."
+          },
+          "symbol": {
+            "type": "string",
+            "description": "Exact definition name."
+          },
+          "k": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "Max hits to return (default 5)."
+          }
+        },
+        "required": [
+          "slug",
+          "symbol"
+        ]
+      }
+    },
+    {
+      "name": "xerj_hub_ask",
+      "description": "Ask a hub corpus a question in one turn — no clone, no local indexing. Local packs first, hosted second, exactly like `xerj ask`. The corpus is optional (routed by the offline sketch when omitted) and is always named in the answer; when more than one corpus fits, the candidates come back and you re-ask with `corpus`. Never downloads a pack: a corpus not on this machine is answered with the `xerj hub pull` line to run, and never fetches the catalogue: with none cached it says to run `xerj hub sync`. Result text is the hub rendering (corpus, pin date, licence, file:line); structured content is the Answer JSON.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "Natural-language question."
+          },
+          "corpus": {
+            "type": "string",
+            "description": "Optional explicit corpus slug; omit to route by sketch."
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "def",
+              "how",
+              "files"
+            ],
+            "description": "Answer shape; omit for auto (a lone identifier or 'what is the value of X' is def)."
+          },
+          "max_tokens": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8192,
+            "description": "Soft output budget for the rendered answer (about 4 characters a token)."
+          }
+        },
+        "required": [
+          "question"
+        ]
+      }
     }
   ]
 }

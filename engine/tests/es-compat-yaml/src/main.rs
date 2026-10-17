@@ -861,6 +861,14 @@ fn resolve_action(action: &str, params: &serde_yaml::Mapping) -> (String, String
             }
             ("DELETE".into(), path, None)
         }
+        "indices.analyze" => {
+            let path = if index.is_empty() {
+                "/_analyze".to_string()
+            } else {
+                format!("/{}/_analyze", index)
+            };
+            ("POST".into(), path, body)
+        }
         "indices.refresh" => (
             "POST".into(),
             format!("/{}/_refresh", if index.is_empty() { "*" } else { &index }),

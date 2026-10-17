@@ -316,6 +316,7 @@ HTTP Request
 | `xerj-cluster` | Embedded Raft consensus for cluster metadata, written from scratch |
 | `xerj-mcp` | MCP stdio server exposing XERJ's REST surface to agent hosts as tools |
 | `xerj-rerank` | Second-stage reranking client for `_search`: strict `rerank` block parser, provider call with batching and a deadline, degrade-on-deadline / surface-on-contract failure policy. A leaf the API layer calls; the engine does not link it |
+| `xerj-hub` | Corpus Hub v2 client behind `xerj ask` / `xerj "<question>"`, `xerj hub …` and `xerj code <corpus> --def`: pulls, verifies and restores signed pre-indexed packs, builds them for CI, and routes a question to a corpus. Depends on `xerj-autoindex`; the engine does not link it |
 | `xerj-wasm` | Pluggable ingest-time document transform pipeline |
 
 Every crate under `crates/` appears in this table — `crates/xerj-engine/tests/docs_capability_lists.rs`
@@ -378,7 +379,8 @@ limit of 4,096.  This accommodates current and next-generation embedding models:
 | GPT-4o embeddings       | 3,072      |
 | Custom / future models  | ≤ 16,384   |
 
-Set `max_dimensions` in `xerj.toml` (default is 16,384).
+There is no enforced dimension cap: `[vector] max_dimensions` (default 16,384) is accepted
+but not wired in this build, and setting it logs a warning at startup.
 
 ## Embedding Token Limits
 
@@ -445,4 +447,4 @@ cargo clippy -- -D warnings
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](../LICENSE).

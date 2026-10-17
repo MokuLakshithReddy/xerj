@@ -13,6 +13,19 @@ use serde::{Deserialize, Serialize};
 use crate::error::XerjError;
 use crate::types::{FieldConfig, FieldType, Schema};
 
+/// Render epoch milliseconds as an ISO-8601 UTC string with millisecond
+/// precision (`2026-10-06T11:09:13.000Z`). One definition for every caller
+/// that has to render a date the way `min`/`max` aggregations render their
+/// `value_as_string`: the engine's agg layer (xerj-engine/src/aggs.rs, its
+/// former private copy) and the autoindex catalog read-back, which replaced
+/// those aggs with sorted size-1 reads (#1183) and must not diverge from the
+/// rendering the catalog already published.
+pub fn epoch_ms_to_iso8601_utc(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Dynamic mapping mode
 // ═════════════════════════════════════════════════════════════════════════════

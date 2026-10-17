@@ -88,9 +88,9 @@ pub fn discover_local_admin_key() -> Option<(String, PathBuf)> {
             }
         })
         .collect();
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(&home).join(".xerj/brain/admin.key"));
-        paths.push(PathBuf::from(&home).join(".xerj/admin.key"));
+    if let Some(home) = crate::home::home_dir() {
+        paths.push(home.join(".xerj/brain/admin.key"));
+        paths.push(home.join(".xerj/admin.key"));
     }
     paths.into_iter().find_map(|p| {
         std::fs::read_to_string(&p)

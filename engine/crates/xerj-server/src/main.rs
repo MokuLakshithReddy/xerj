@@ -86,7 +86,7 @@ use tokio::signal;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use xerj_api::{build_es_compat_router, build_native_router, AppState};
+use xerj_api::{build_es_compat_router_with_hub, build_native_router, AppState};
 use xerj_cluster::{transport::TcpTransport, ClusterNode, ClusterRunner};
 use xerj_common::{config::Config, metrics::Metrics};
 use xerj_console_api::{state::ClusterMode, ConsoleState, RpConfig};
@@ -96,6 +96,7 @@ mod brain;
 #[cfg(all(target_os = "linux", feature = "debug-profiling"))]
 mod debug_profiling;
 mod grpc;
+mod grpc_hub;
 mod ingest_memory_trace;
 mod share;
 
@@ -109,6 +110,7 @@ struct CliArgs {
     data_dir: Option<String>,
     bind: Option<String>,
     port: Option<String>,
+    auto_port: Option<bool>,
     insecure: bool,
     embed_mode: Option<String>,
     onnx_model: Option<String>,
@@ -120,14 +122,38 @@ struct CliArgs {
 }
 
 fn parse_args() -> CliArgs {
-    parse_args_from(std::env::args().skip(1))
+    parse_args_from(std::env::args().skip(1)).unwrap_or_else(|e| {
+        eprintln!("error: {e}. Use --help for usage.");
+        std::process::exit(2);
+    })
+}
+
+/// The value that must follow `flag`. A flag given last on the line, or
+/// followed straight by another `--flag`, has no value: that is an error, not
+/// a silent "unset" — `xerj --insecure --data-dir` used to boot on the default
+/// data directory, and `xerj --data-dir --insecure` used a directory literally
+/// named `--insecure` and left auth on (#1435). The short forms are the same
+/// trap — `xerj --data-dir -k` must not name the directory `-k` and drop
+/// `--insecure` — so a single dash plus one letter counts as a flag too; any
+/// longer single-dash value (`-data`, `-1`, `::1`) is still a value.
+fn flag_value(flag: &str, next: Option<String>) -> Result<String, String> {
+    match next {
+        Some(v) if !looks_like_flag(&v) => Ok(v),
+        Some(v) => Err(format!("{flag} needs a value, got the flag {v}")),
+        None => Err(format!("{flag} needs a value")),
+    }
+}
+
+/// `--anything`, or a short flag such as `-k` / `-d`.
+fn looks_like_flag(v: &str) -> bool {
+    v.starts_with("--") || matches!(v.as_bytes(), [b'-', c] if c.is_ascii_alphabetic())
 }
 
 /// The body of [`parse_args`], over any iterator of arguments — the same
 /// testable-parse shape as `brain::parse` and `share::parse`, so the CLI
 /// grammar is unit-tested without touching process-wide `argv` (which every
 /// test in the same binary shares).
-fn parse_args_from<I>(args: I) -> CliArgs
+fn parse_args_from<I>(args: I) -> Result<CliArgs, String>
 where
     I: Iterator<Item = String>,
 {
@@ -136,6 +162,7 @@ where
     let mut data_dir = None;
     let mut bind = None;
     let mut port: Option<String> = None;
+    let mut auto_port = None;
     let mut insecure = false;
     let mut embed_mode = None;
     let mut onnx_model = None;
@@ -148,29 +175,35 @@ where
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" | "-c" => {
-                config = args.next().map(PathBuf::from);
+                config = Some(PathBuf::from(flag_value(&arg, args.next())?));
             }
             "--data-dir" | "-d" => {
-                data_dir = args.next();
+                data_dir = Some(flag_value(&arg, args.next())?);
             }
             "--bind" | "-b" => {
-                bind = args.next();
+                bind = Some(flag_value(&arg, args.next())?);
             }
             "--port" => {
-                port = args.next();
+                port = Some(flag_value(&arg, args.next())?);
+            }
+            "--auto-port" => {
+                auto_port = Some(true);
+            }
+            "--no-auto-port" => {
+                auto_port = Some(false);
             }
             "--insecure" | "-k" => {
                 insecure = true;
             }
             "--embed-mode" => {
-                embed_mode = args.next();
+                embed_mode = Some(flag_value(&arg, args.next())?);
             }
-            "--onnx-model" => onnx_model = args.next(),
-            "--onnx-tokenizer" => onnx_tokenizer = args.next(),
-            "--compat-distribution" => compat_distribution = args.next(),
-            "--compat-version" => compat_version = args.next(),
-            "--decide-mode" => decide_mode = args.next(),
-            "--decide-model-dir" => decide_model_dir = args.next(),
+            "--onnx-model" => onnx_model = Some(flag_value(&arg, args.next())?),
+            "--onnx-tokenizer" => onnx_tokenizer = Some(flag_value(&arg, args.next())?),
+            "--compat-distribution" => compat_distribution = Some(flag_value(&arg, args.next())?),
+            "--compat-version" => compat_version = Some(flag_value(&arg, args.next())?),
+            "--decide-mode" => decide_mode = Some(flag_value(&arg, args.next())?),
+            "--decide-model-dir" => decide_model_dir = Some(flag_value(&arg, args.next())?),
             // Read out of band by `xerj_common::feedback` (which scans the
             // whole argument list, so its position never matters); accepted
             // here only so it is not an "unknown argument".
@@ -190,11 +223,12 @@ where
         }
     }
 
-    CliArgs {
+    Ok(CliArgs {
         config,
         data_dir,
         bind,
         port,
+        auto_port,
         insecure,
         embed_mode,
         onnx_model,
@@ -203,7 +237,7 @@ where
         compat_version,
         decide_mode,
         decide_model_dir,
-    }
+    })
 }
 
 fn print_help() {
@@ -228,7 +262,8 @@ fn help_text(feedback: bool) -> String {
                                                   of peer projects (see xerj code --help)\n\
              xerj corpus add|index|list          the corpus lifecycle behind `xerj code`\n\
                                                   (see xerj corpus --help)\n\
-             xerj index [OPTIONS]                direct NDJSON → engine ingest (see xerj\n\
+         {ask_lines}\
+         xerj index [OPTIONS]                direct NDJSON → engine ingest (see xerj\n\
                                                   index --help)\n\
              xerj brain <folder>                 index + browse in one command (see xerj\n\
                                                   brain --help)\n\
@@ -239,7 +274,11 @@ fn help_text(feedback: bool) -> String {
                                                   PR) — see xerj feedback --help\n\
          \n\
          OPTIONS (for `xerj [OPTIONS]`, the bare server start):\n\
-             --config,   -c <PATH>  Path to TOML config file\n\
+             --config,   -c <PATH>  Path to TOML config file. CORS is off by default (no\n\
+                                      Access-Control-* headers); a browser app calling the node\n\
+                                      directly needs [cors] allowed_origins =\n\
+                                      [\"http://localhost:8080\"] there (allow_any_origin = true\n\
+                                      is for local development only)\n\
              --data-dir, -d <PATH>  Override data directory\n\
              --bind,     -b <ADDR>  Interface to bind every listener to. Default 127.0.0.1 —\n\
                                       loopback only, reachable from this machine and nowhere\n\
@@ -302,9 +341,16 @@ fn help_text(feedback: bool) -> String {
                                       local file only, no download path. Env:\n\
                                       XERJ_DECIDE_MODEL_DIR\n\
              --port      <PORT>     Port for the Elasticsearch-compatible API (default 9200).\n\
-                                      Also claims PORT+1 for the native REST API and PORT+2\n\
-                                      for gRPC, so a second instance needs only this one flag:\n\
-                                      xerj --insecure --port 9300 -d ./other-data\n\
+                                      When given, also claims PORT+1 for the native REST API and\n\
+                                      PORT+2 for gRPC, so a second instance needs only this one\n\
+                                      flag: xerj --insecure --port 9300 -d ./other-data\n\
+                                      Without it the native REST API listens on 8080 and gRPC on\n\
+                                      8081 ([server] rest_port / grpc_port in the TOML config).\n\
+             --auto-port            Opt in to multi-instance mode: if a port is taken, bind the\n\
+                                      next free one; if the data dir is held by another live\n\
+                                      process, use <data-dir>-2, -3, ... The banner prints the\n\
+                                      ports actually bound. Off by default. Env: XERJ_AUTO_PORT\n\
+             --no-auto-port         Fail at startup if a port is taken (the default).\n\
              --disable-feedback     Do not print the feedback invitation above. Honoured in any\n\
                                       position, including after --help. Env:\n\
                                       XERJ_DISABLE_FEEDBACK=true\n\
@@ -329,10 +375,11 @@ fn help_text(feedback: bool) -> String {
                                              log — searches, hit rate, latency (xerj gain --help)\n\
              xerj brain      <folder>        one command: index a folder into a running, browsable\n\
                                              second brain in your browser (see xerj brain --help)\n\
-             xerj mcp        [opts]          Model Context Protocol stdio server: exposes 13 tools\n\
+             xerj mcp        [opts]          Model Context Protocol stdio server: exposes {mcp_tools} tools\n\
                                              (search, semantic, vector, hybrid, memory, second-brain,\n\
-                                             code-search) to any MCP client. Proxies to a node you\n\
-                                             already started — set XERJ_URL or --url (see xerj mcp --help)\n\
+                                             map, plan, code-search, Corpus Hub) to any MCP client.\n\
+                                             Proxies to a node you already started — set XERJ_URL or\n\
+                                             --url (see xerj mcp --help)\n\
              xerj feedback   [opts]          draft the agent field report XERJ asks every agent to\n\
                                              file, auto-filling version/OS/what-was-indexed; --open-pr\n\
                                              files it, --dry-run just prints (see xerj feedback --help)\n\
@@ -390,7 +437,33 @@ fn help_text(feedback: bool) -> String {
                 settings are resolved independently, mix and match as needed.)\n",
         env!("CARGO_PKG_VERSION"),
         xerj_common::feedback::block(feedback),
+        // Counted from the served `tools/list`, not typed: the literal "13"
+        // went stale the day the three Corpus Hub tools landed (#1443).
+        mcp_tools = mcp_tool_count(),
+        ask_lines = ask_help_lines(xerj_common::hub::hub_key_configured()),
     )
+}
+
+/// The `xerj ask` usage lines. A build with no hub signing key can verify no
+/// pack, so there the line says the command is unavailable instead of
+/// promising a pull that will only ever exit 5.
+fn ask_help_lines(hub: bool) -> &'static str {
+    if hub {
+        "xerj ask \"<question>\"              answer a question from a hub corpus: the\n\
+         pre-indexed pack is pulled the first time\n\
+         (see xerj ask --help); `xerj \"<question>\"`\n\
+         is the same\n"
+    } else {
+        "xerj ask \"<question>\"              Corpus Hub answers: not available in this\n\
+         build (no hub signing key; exits 5) - use\n\
+         xerj corpus + xerj code instead\n"
+    }
+}
+
+/// How many tools `xerj mcp` serves — the length of the same `tool_specs()`
+/// array its `tools/list` returns.
+fn mcp_tool_count() -> usize {
+    xerj_mcp::tool_specs().as_array().map_or(0, Vec::len)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -571,23 +644,6 @@ fn load_config(args: &CliArgs) -> Result<Config> {
         anyhow::bail!("config error: {reason}");
     }
 
-    // Merge settings this build accepts but does not act on. An operator who
-    // throttles merges to protect query latency was getting no throttle and no
-    // signal (#207); the signal is the minimum. See
-    // `MergeConfig::dormant_overrides` for why these are a warning rather than
-    // the hard startup error `storage.backend` gets.
-    for (key, effect) in cfg.merge.dormant_overrides() {
-        warn!("{key} is set but has no effect in this build: {effect}");
-    }
-
-    // Same treatment for `[compression]` (#318): `level` is wired into the
-    // merge re-encode, `enabled` and `block_size_docs` are not, and an
-    // operator who set all three to trade CPU for $/GB previously got three
-    // no-ops in silence.
-    for (key, effect) in cfg.compression.dormant_overrides() {
-        warn!("{key} is set but has no effect in this build: {effect}");
-    }
-
     // Bind address override: `--bind` flag or `XERJ_BIND_ADDRESS` env (flag
     // wins). Both exist because the default is loopback (#228): without a way
     // to say "expose me" that is not a TOML file, a container image or a
@@ -630,6 +686,31 @@ fn load_config(args: &CliArgs) -> Result<Config> {
         cfg.server.es_compat_port = base;
         cfg.server.rest_port = base + 1;
         cfg.server.grpc_port = base + 2;
+    }
+
+    // Multi-instance auto-port selection: when enabled, if the requested
+    // listener ports are already in use, the server scans for and binds the
+    // next free ports, and moves off a data dir another live process holds.
+    //
+    // OPT-IN ONLY (flag, env, or `[server] auto_port = true`). A taken port is
+    // a fatal startup error by default on purpose (issue #465): a client
+    // pointed at the requested port would otherwise talk to — and write into —
+    // whichever other instance owns it, while this one reports success on a
+    // port nobody is addressing. Precedence: CLI flag > env > config file.
+    if let Some(ap) = args.auto_port {
+        cfg.server.auto_port = ap;
+    } else if let Ok(raw) = std::env::var("XERJ_AUTO_PORT") {
+        // Parsed strictly, like XERJ_ALLOW_INSECURE_NETWORK_BIND: a typo must
+        // not silently pick a behaviour the operator did not ask for.
+        cfg.server.auto_port = match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => anyhow::bail!("XERJ_AUTO_PORT={raw:?} is not a boolean; use true or false"),
+        };
+    }
+
+    if cfg.server.auto_port {
+        cfg.server.data_dir = resolve_available_data_dir(&cfg.server.data_dir);
     }
 
     // The #228 opt-out, also settable from the environment so a container can
@@ -731,6 +812,24 @@ fn load_config(args: &CliArgs) -> Result<Config> {
                     u32::MAX
                 );
             }
+        }
+    }
+
+    // #1189: an explicit mode=proxy is validated at boot, the same
+    // fail-closed contract as onnx-experimental above. The old warn-plus-
+    // lexical fallback started a "healthy" node whose embedding requests
+    // silently wrote lexical vectors. Auto keeps its documented fallback.
+    if cfg.embedding.mode.trim().eq_ignore_ascii_case("proxy") {
+        if cfg.embedding.default_endpoint.trim().is_empty() {
+            anyhow::bail!(
+                "embedding.mode=proxy requires embedding.default_endpoint to be set; \
+                 remove mode=proxy (use auto) if a lexical fallback is wanted"
+            );
+        }
+        if let Err(e) =
+            xerj_ai::embed::EmbeddingProxy::new(xerj_engine::index::proxy_config(&cfg.embedding))
+        {
+            anyhow::bail!("embedding.mode=proxy failed to initialize: {e}");
         }
     }
 
@@ -980,6 +1079,23 @@ async fn build_tls_config(cfg: &Config) -> Result<Option<RustlsConfig>> {
 // Observability
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Settings this build accepts but does not act on. An operator who throttles
+/// merges to protect query latency was getting no throttle and no signal
+/// (#207); the signal is the minimum. See `MergeConfig::dormant_overrides` for
+/// why these are a warning rather than the hard startup error `storage.backend`
+/// gets. `[compression]` (#318) and the `[fts]` / `[vector]` / `[logs]` /
+/// `[indexing]` / `storage.local_cache_dir` keys that nothing reads get the
+/// same treatment — `Config::dormant_overrides` collects every section.
+///
+/// Call it after `init_tracing`. It used to run inside `load_config`, which
+/// runs before the subscriber exists, so every one of these warnings was
+/// dropped and an operator saw nothing.
+fn warn_dormant_overrides(cfg: &Config) {
+    for (key, effect) in cfg.dormant_overrides() {
+        warn!("{key} is set but has no effect in this build: {effect}");
+    }
+}
+
 fn init_tracing(logging: &xerj_common::config::LoggingConfig) {
     let mut filter = EnvFilter::try_from_env("XERJ_LOG")
         .or_else(|_| EnvFilter::try_from_env("RUST_LOG"))
@@ -1124,6 +1240,101 @@ fn bind_listener(addr: SocketAddr, name: &str) -> Result<std::net::TcpListener> 
     Ok(listener)
 }
 
+/// If `data_dir` is currently locked by another live process, find the first
+/// sibling directory (`<dir>-2`, `<dir>-3`, ...) that is not, so multiple
+/// opted-in (`--auto-port`) instances can run side by side.
+///
+/// Advisory only: the engine re-acquires `node.lock` itself at open and fails
+/// cleanly if a racing instance took the directory in between. After
+/// [`MAX_DATA_DIR_SIBLINGS`] held siblings it gives up and returns the
+/// requested dir, so that engine lock error is what the operator sees.
+fn resolve_available_data_dir(requested: &str) -> String {
+    // A trailing separator would turn `./data/` into `./data/-2` — a
+    // directory INSIDE the held data dir. Siblings are built from the
+    // trimmed spelling (`/` alone is left as is).
+    let base = requested.trim_end_matches(['/', std::path::MAIN_SEPARATOR]);
+    let base = if base.is_empty() { requested } else { base };
+    if !data_dir_held(Path::new(base)) {
+        return requested.to_string();
+    }
+    for i in 2..=MAX_DATA_DIR_SIBLINGS + 1 {
+        let candidate = format!("{base}-{i}");
+        if !data_dir_held(Path::new(&candidate)) {
+            warn!(
+                "data dir '{requested}' is held by another running xerj process; \
+                 --auto-port: using '{candidate}' for this instance"
+            );
+            return candidate;
+        }
+    }
+    requested.to_string()
+}
+
+/// How many `<dir>-N` siblings [`resolve_available_data_dir`] will try.
+const MAX_DATA_DIR_SIBLINGS: usize = 64;
+
+/// Is `dir/node.lock` currently locked by a live process? A missing or
+/// unopenable lock file is "not held" — the engine's own lock acquisition is
+/// the authority and reports anything stranger.
+fn data_dir_held(dir: &Path) -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("node.lock"))
+        .is_ok_and(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+}
+
+/// Bind one listener, attempting consecutive ports if `auto_port` is true and
+/// the starting port is already in use (`AddrInUse`).
+fn bind_listener_candidate(
+    ip: std::net::IpAddr,
+    port: u16,
+    name: &'static str,
+    auto_port: bool,
+    avoid_ports: &[u16],
+) -> Result<(std::net::TcpListener, u16)> {
+    // Port 0 asks the kernel for an ephemeral port, which can never be "in
+    // use": there is nothing to scan, and the port to report is the one the
+    // kernel handed back, not the 0 that was requested.
+    if !auto_port || port == 0 {
+        let addr = SocketAddr::new(ip, port);
+        let listener = bind_listener(addr, name)?;
+        let bound = listener
+            .local_addr()
+            .with_context(|| format!("{name}: read the bound address"))?
+            .port();
+        return Ok((listener, bound));
+    }
+
+    // Scan in u16 space without ever incrementing past 65535 (a `+= 1` there
+    // would panic in debug and wrap to the ephemeral port 0 in release).
+    let max_port = port.saturating_add(AUTO_PORT_SCAN);
+    for candidate in port..=max_port {
+        if avoid_ports.contains(&candidate) {
+            continue;
+        }
+        let addr = SocketAddr::new(ip, candidate);
+        match std::net::TcpListener::bind(addr) {
+            Ok(listener) => {
+                listener
+                    .set_nonblocking(true)
+                    .with_context(|| format!("{name}: set the listener on {addr} non-blocking"))?;
+                if candidate != port {
+                    warn!("{name}: port {port} is in use; --auto-port bound {candidate} instead");
+                }
+                return Ok((listener, candidate));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(e) => return Err(anyhow::anyhow!("{name}: bind {addr}: {e}")),
+        }
+    }
+
+    anyhow::bail!("{name}: could not find a free port between {port} and {max_port}");
+}
+
+/// How far past the requested port `--auto-port` scans.
+const AUTO_PORT_SCAN: u16 = 1000;
+
 async fn serve_on(
     router: Router,
     listener: std::net::TcpListener,
@@ -1207,6 +1418,29 @@ struct IndexCmdArgs {
     data_dir: Option<String>,
 }
 
+/// `xerj index`'s string flag value; exits 2 on a missing one (see [`flag_value`]).
+fn index_flag_value(flag: &str, next: Option<String>) -> String {
+    flag_value(flag, next).unwrap_or_else(|e| {
+        eprintln!("error: {e}. Use --help for usage.");
+        std::process::exit(2);
+    })
+}
+
+/// `xerj index`'s numeric flag value. `--batch abc` used to fall back to the
+/// default without a word, so a typo silently changed the run (#1435).
+fn index_flag_count(flag: &str, next: Option<String>) -> usize {
+    parse_count(flag, next).unwrap_or_else(|e| {
+        eprintln!("error: {e}. Use --help for usage.");
+        std::process::exit(2);
+    })
+}
+
+fn parse_count(flag: &str, next: Option<String>) -> Result<usize, String> {
+    let v = flag_value(flag, next)?;
+    v.parse()
+        .map_err(|_| format!("{flag} must be a non-negative whole number, got {v:?}"))
+}
+
 fn parse_index_args() -> IndexCmdArgs {
     // Skip argv[0] (binary) + argv[1] ("index").
     let mut args = std::env::args().skip(2);
@@ -1220,19 +1454,13 @@ fn parse_index_args() -> IndexCmdArgs {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--index" | "-i" => index = args.next(),
-            "--file" | "-f" => file = args.next().map(PathBuf::from),
-            "--batch" | "-b" => {
-                batch = args.next().and_then(|s| s.parse().ok()).unwrap_or(5000);
-            }
-            "--workers" | "-w" => {
-                workers = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            }
-            "--limit" | "-l" => {
-                limit = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            }
-            "--config" | "-c" => config = args.next().map(PathBuf::from),
-            "--data-dir" | "-d" => data_dir = args.next(),
+            "--index" | "-i" => index = Some(index_flag_value(&arg, args.next())),
+            "--file" | "-f" => file = Some(PathBuf::from(index_flag_value(&arg, args.next()))),
+            "--batch" | "-b" => batch = index_flag_count(&arg, args.next()),
+            "--workers" | "-w" => workers = index_flag_count(&arg, args.next()),
+            "--limit" | "-l" => limit = index_flag_count(&arg, args.next()),
+            "--config" | "-c" => config = Some(PathBuf::from(index_flag_value(&arg, args.next()))),
+            "--data-dir" | "-d" => data_dir = Some(index_flag_value(&arg, args.next())),
             xerj_common::feedback::DISABLE_FLAG => {}
             "--help" | "-h" => {
                 print_index_help();
@@ -1314,6 +1542,10 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
         config: cmd.config.clone(),
         // No listener is bound for in-process indexing, so no port applies.
         port: None,
+        // Never relocate the data dir here: indexing into `<dir>-2` because a
+        // server holds `<dir>` would report success into a directory nobody
+        // serves. The engine's node.lock error is the right answer.
+        auto_port: Some(false),
         data_dir: cmd.data_dir.clone(),
         // In-process CLI indexing binds no listener at all, so the bind
         // address is irrelevant here — take whatever the config says.
@@ -1332,6 +1564,7 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
     let mut cfg = load_config(&fake_cli)?;
     // Tracing after config so the [logging] format applies (RC4-W4 item 6).
     init_tracing(&cfg.logging);
+    warn_dormant_overrides(&cfg);
     cfg.tls.enabled = false;
     cfg.auth.enabled = false;
     cfg.cluster.enabled = false;
@@ -1791,6 +2024,19 @@ fn main() -> Result<()> {
         std::process::exit(xerj_autoindex::extract::pdf::run_worker_cli());
     }
 
+    // The isolated legacy-`.xls` BIFF reader. calamine 0.26.1 panics on crafted
+    // records (short `Lbl`/`ExternSheet`) and the release profile is
+    // `panic = abort`, so the read runs here, in a short-lived rlimit-capped
+    // child, where a crash dies with the child instead of aborting the indexer.
+    // Dispatched before the Tokio pool for the same smallness reason as the PDF
+    // worker above.
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some(xerj_autoindex::extract::xls::WORKER_ARG)
+    ) {
+        std::process::exit(xerj_autoindex::extract::xls::run_worker_cli());
+    }
+
     // `xerj mcp` — MCP stdio server (newline-delimited JSON-RPC on
     // stdin/stdout), proxying to an already-running XERJ node.
     //
@@ -1964,7 +2210,8 @@ mod decide_flag_tests {
             "local",
             "--decide-model-dir",
             "/models/xerj-decide",
-        ]));
+        ]))
+        .unwrap();
         assert_eq!(args.decide_mode.as_deref(), Some("local"));
         assert_eq!(
             args.decide_model_dir.as_deref(),
@@ -1973,8 +2220,61 @@ mod decide_flag_tests {
     }
 
     #[test]
+    fn a_value_flag_without_its_value_is_an_error_not_unset() {
+        // #1435: given last, or followed by another flag, the value is
+        // missing — this used to boot on the default silently.
+        for line in [
+            &["--insecure", "--data-dir"][..],
+            &["--port"][..],
+            &["-c"][..],
+            &["--data-dir", "--insecure"][..],
+            &["--bind", "--port", "9300"][..],
+            &["--decide-model-dir"][..],
+            &["--data-dir", "-k"][..],
+            &["-d", "-c", "xerj.toml"][..],
+        ] {
+            let err = parse_args_from(argv(line)).err();
+            assert!(
+                err.as_deref().is_some_and(|e| e.contains("needs a value")),
+                "{line:?} must be refused, got {err:?}"
+            );
+        }
+        // A value that merely contains or starts with a single dash is fine.
+        let args = parse_args_from(argv(&["-d", "-data", "--bind", "::1"])).unwrap();
+        assert_eq!(args.data_dir.as_deref(), Some("-data"));
+        assert_eq!(args.bind.as_deref(), Some("::1"));
+        let args = parse_args_from(argv(&["--port", "-1"])).unwrap();
+        assert_eq!(args.port.as_deref(), Some("-1"), "left to the port check");
+    }
+
+    #[test]
+    fn index_counts_refuse_a_non_number_instead_of_defaulting() {
+        use super::parse_count;
+        assert_eq!(parse_count("--batch", Some("200".into())), Ok(200));
+        assert!(parse_count("--batch", Some("abc".into()))
+            .unwrap_err()
+            .contains("whole number"));
+        assert!(parse_count("--workers", Some("-1".into())).is_err());
+        assert!(parse_count("--limit", None)
+            .unwrap_err()
+            .contains("needs a value"));
+    }
+
+    #[test]
+    fn help_counts_the_mcp_tools_actually_served() {
+        // #1443: the help said "exposes 13 tools" while `tools/list` served 16.
+        let served = super::mcp_tool_count();
+        assert!(served >= 16, "tool_specs() shrank to {served}");
+        let help = help_text(false);
+        assert!(
+            help.contains(&format!("exposes {served} tools")),
+            "help must state the served tool count {served}, got:\n{help}"
+        );
+    }
+
+    #[test]
     fn decide_flags_default_to_none() {
-        let args = parse_args_from(argv(&[]));
+        let args = parse_args_from(argv(&[])).unwrap();
         assert_eq!(args.decide_mode, None);
         assert_eq!(args.decide_model_dir, None);
     }
@@ -1995,7 +2295,8 @@ mod decide_flag_tests {
             "opensearch",
             "-d",
             "./data",
-        ]));
+        ]))
+        .unwrap();
         assert!(args.insecure);
         assert_eq!(args.embed_mode.as_deref(), Some("neural"));
         assert_eq!(args.compat_distribution.as_deref(), Some("opensearch"));
@@ -2255,9 +2556,11 @@ async fn async_main() -> Result<()> {
     if matches!(argv1.as_deref(), Some("code")) {
         // Reference-coding retrieval (issue #977, previously xc.py): blocking
         // ES-compat client + local state ledger, synchronous — off the
-        // runtime like `def`.
+        // runtime like `def`. Routed through the hub CLI so `--def <SYMBOL>`
+        // answers from the `-defs` index; every other invocation delegates
+        // unchanged to `xc::run_code_cli` (Corpus Hub v2, §3).
         let args: Vec<String> = std::env::args().skip(2).collect();
-        let code = tokio::task::spawn_blocking(move || xerj_autoindex::xc::run_code_cli(&args))
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_code(&args))
             .await
             .unwrap_or(1);
         std::process::exit(code);
@@ -2268,6 +2571,35 @@ async fn async_main() -> Result<()> {
         // synchronous — off the runtime like `autoindex`.
         let args: Vec<String> = std::env::args().skip(2).collect();
         let code = tokio::task::spawn_blocking(move || xerj_autoindex::xc::run_corpus_cli(&args))
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("hub")) {
+        // Corpus Hub v2 (discussion #1374): pull pre-indexed, signed packs and
+        // build them (CI). Synchronous (git + blocking HTTP) — off the runtime
+        // like `corpus`.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_hub_cli(&args))
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("ask")) {
+        // Corpus Hub v2 answer flow (plan §5): route the question to a hub
+        // corpus, answer from its pack (pulling it the first time). Blocking
+        // HTTP + process spawn — off the runtime like `hub`.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_ask(&args))
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if xerj_hub::cli::is_bare_question(argv1.as_deref()) {
+        // `xerj "how does lz4 frame work"`: argv[1] is not a subcommand, does
+        // not start with `-`, and contains a space — the same as `xerj ask`.
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let code = tokio::task::spawn_blocking(move || xerj_hub::cli::run_ask(&args))
             .await
             .unwrap_or(1);
         std::process::exit(code);
@@ -2293,6 +2625,7 @@ async fn async_main() -> Result<()> {
     init_tracing(&cfg.logging);
 
     info!("xerj v{} starting", env!("CARGO_PKG_VERSION"));
+    warn_dormant_overrides(&cfg);
 
     // 3a. `server.bind_address` must be an IP literal — and must be rejected
     //     *here*, ahead of the two exposure checks that follow.
@@ -2444,6 +2777,17 @@ async fn async_main() -> Result<()> {
     let cluster_listen_addr = cfg.socket_addr(cfg.cluster.port);
 
     // 8b. Cluster runner (if cluster mode is enabled)
+    //
+    // The boot outcome is recorded for the REST layer (#1171): a configured
+    // ring whose transport cannot bind degrades to single-node with one
+    // ERROR line and then nothing — health reports the degraded state
+    // instead of green silence. Starts as Degraded for every enabled path
+    // and is only upgraded to Running when the runner actually started.
+    let mut cluster_transport_outcome = if cfg.cluster.enabled {
+        xerj_api::state::ClusterTransportStatus::Degraded
+    } else {
+        xerj_api::state::ClusterTransportStatus::Disabled
+    };
     let _cluster_shutdown = if cfg.cluster.enabled && storage_available {
         // Fail closed (issue #75). The cluster port carries Raft control
         // messages; without a shared secret every frame on it is
@@ -2491,6 +2835,26 @@ async fn async_main() -> Result<()> {
         // (`SocketAddr::parse`, just above), not the unparseable `::1:9300`.
         let node_id = listen_addr.to_string();
 
+        // The documented `peers` convention lists the FULL membership on
+        // every node — "the current node's id is inferred from the entry
+        // whose address matches its own" (docs/clustering) — so this node's
+        // own entry is expected to be in the map. Self is not a peer: left
+        // in, the Raft node counted 4 members of a 3-node ring (majority 3 =
+        // unanimity, no fault tolerance) and every node sent its own
+        // RequestVote back to itself over loopback TCP, counting its own
+        // vote twice — the measured result was a ring that churned through
+        // a new election every few hundred ms forever after ANY node died
+        // (#1168). Removed here, once, so the transport peer map and the
+        // Raft peer list agree. The cluster crate also excludes self
+        // defensively on both layers.
+        if peers.remove(&node_id).is_some() {
+            info!(
+                node = %node_id,
+                "cluster.peers included this node's own address — excluded from the peer set \
+                 (self is not a peer)"
+            );
+        }
+
         let tick = std::time::Duration::from_millis(cfg.cluster.tick_ms);
 
         match TcpTransport::new(node_id.clone(), listen_addr, peers, cluster_secret).await {
@@ -2500,12 +2864,14 @@ async fn async_main() -> Result<()> {
                     .peers
                     .iter()
                     .filter_map(|p| p.split_once('=').map(|(id, _)| id.to_string()))
+                    .filter(|id| id != &node_id)
                     .collect();
 
                 let node = ClusterNode::new(node_id.clone(), peer_ids, Box::new(transport));
                 let mut runner = ClusterRunner::new(node, tick, shutdown_rx);
 
                 info!(node = %node_id, "Starting cluster runner (Raft mode)");
+                cluster_transport_outcome = xerj_api::state::ClusterTransportStatus::Running;
                 tokio::spawn(async move { runner.run().await });
             }
             Err(e) => {
@@ -2555,19 +2921,42 @@ async fn async_main() -> Result<()> {
     //     context is kept as a backstop so that if a future edit reorders or
     //     drops 3a, this still names the setting rather than surfacing a bare
     //     `Option` unwrap.
-    let rest_addr: SocketAddr = cfg
-        .socket_addr(cfg.server.rest_port)
-        .with_context(|| bad_bind_address(&cfg))?;
-    let es_addr: SocketAddr = cfg
-        .socket_addr(cfg.server.es_compat_port)
-        .with_context(|| bad_bind_address(&cfg))?;
-    let grpc_addr: SocketAddr = cfg
-        .socket_addr(cfg.server.grpc_port)
-        .with_context(|| bad_bind_address(&cfg))?;
+    let ip = cfg.bind_ip().with_context(|| bad_bind_address(&cfg))?;
 
-    let rest_listener = bind_listener(rest_addr, "native REST")?;
-    let es_listener = bind_listener(es_addr, "ES-compat")?;
-    let grpc_listener = bind_listener(grpc_addr, "gRPC")?;
+    let mut avoid: Vec<u16> = Vec::new();
+    if cfg.cluster.enabled {
+        avoid.push(cfg.cluster.port);
+    }
+
+    let (es_listener, bound_es_port) = bind_listener_candidate(
+        ip,
+        cfg.server.es_compat_port,
+        "ES-compat",
+        cfg.server.auto_port,
+        &avoid,
+    )?;
+    avoid.push(bound_es_port);
+
+    let (rest_listener, bound_rest_port) = bind_listener_candidate(
+        ip,
+        cfg.server.rest_port,
+        "native REST",
+        cfg.server.auto_port,
+        &avoid,
+    )?;
+    avoid.push(bound_rest_port);
+
+    let (grpc_listener, bound_grpc_port) = bind_listener_candidate(
+        ip,
+        cfg.server.grpc_port,
+        "gRPC",
+        cfg.server.auto_port,
+        &avoid,
+    )?;
+
+    cfg.server.es_compat_port = bound_es_port;
+    cfg.server.rest_port = bound_rest_port;
+    cfg.server.grpc_port = bound_grpc_port;
 
     let bound = BoundAddrs {
         rest: rest_listener
@@ -2680,6 +3069,15 @@ async fn async_main() -> Result<()> {
     // 9b. Application state
     let mut state = AppState::new(cfg.clone(), engine, metrics);
 
+    // 9b-i. The cluster-transport boot outcome (#1171): `AppState::new`
+    //   seeds the field from the config alone because it cannot see the
+    //   boot; overwrite it with what actually happened in step 8b before
+    //   any router exists to read it. A node whose configured ring failed
+    //   to bind (or whose cluster-state storage was unavailable) serves
+    //   single-node while the operator believes it is clustered — this is
+    //   what lets /_cluster/health say yellow instead of green forever.
+    state.cluster_transport = cluster_transport_outcome;
+
     // 9b-iia. Decide-ladder override (#1057): `--decide-mode` /
     //   `--decide-model-dir` flags or XERJ_DECIDE_MODE / XERJ_DECIDE_MODEL_DIR
     //   env (flags win; the flag can fill either half, so `--decide-mode local`
@@ -2763,7 +3161,10 @@ async fn async_main() -> Result<()> {
     //     merge would leave xerj-api compiling and serving on its own
     //     — a property worth preserving.
     let mut native_router = build_native_router(state.clone());
-    let mut es_router = build_es_compat_router(state.clone());
+    // One hub state for the ES-compat `/_hub/v1/*` routes AND the gRPC
+    // `XerjHub` service: one rate-limit budget per client across both.
+    let hub_shared = xerj_api::hub_api::HubShared::new(state.clone());
+    let mut es_router = build_es_compat_router_with_hub(state.clone(), hub_shared.clone());
     if let Some(console_state) = xerj_console_state {
         let xerj_console_router = xerj_console_api::xerj_console_router(console_state);
         native_router = native_router.merge(xerj_console_router.clone());
@@ -2853,7 +3254,9 @@ async fn async_main() -> Result<()> {
     // made no false claim: it did hold the port.
     let grpc_state = state.clone();
     let grpc = tokio::spawn(async move {
-        if let Err(e) = grpc::serve_grpc_on(grpc_listener, grpc_state, shutdown_signal()).await {
+        if let Err(e) =
+            grpc::serve_grpc_on(grpc_listener, grpc_state, hub_shared, shutdown_signal()).await
+        {
             error!("gRPC server: {e:#}");
         }
     });
@@ -3255,5 +3658,103 @@ mod server_correctness_tests {
         let mode = std::fs::metadata(&stale).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "rewritten secret must be tightened to 0600");
         assert_eq!(std::fs::read(&stale).unwrap(), b"new");
+    }
+}
+
+#[cfg(test)]
+mod auto_port_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, TcpListener};
+
+    const LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    fn held_port() -> (TcpListener, u16) {
+        let l = TcpListener::bind((LO, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        (l, p)
+    }
+
+    #[test]
+    fn auto_port_is_off_unless_asked_for() {
+        // No config file, no flag: a taken port must stay fatal (#465).
+        let args = parse_args_from(["--insecure".to_string()].into_iter()).unwrap();
+        if std::env::var_os("XERJ_AUTO_PORT").is_none() {
+            assert!(!load_config(&args).unwrap().server.auto_port);
+        }
+        let args = parse_args_from(["--auto-port".to_string()].into_iter()).unwrap();
+        assert!(load_config(&args).unwrap().server.auto_port);
+    }
+
+    #[test]
+    fn taken_port_is_fatal_without_auto_port() {
+        let (_held, p) = held_port();
+        assert!(bind_listener_candidate(LO, p, "t", false, &[]).is_err());
+    }
+
+    #[test]
+    fn taken_port_moves_with_auto_port() {
+        let (_held, p) = held_port();
+        let (l, got) = bind_listener_candidate(LO, p, "t", true, &[]).unwrap();
+        assert_ne!(got, p);
+        assert_eq!(l.local_addr().unwrap().port(), got);
+    }
+
+    #[test]
+    fn avoided_ports_are_skipped() {
+        let (held, p) = held_port();
+        drop(held); // p is free now, but listed as reserved for a sibling
+        let (_l, got) = bind_listener_candidate(LO, p, "t", true, &[p]).unwrap();
+        assert_ne!(got, p);
+    }
+
+    #[test]
+    fn ephemeral_port_reports_the_kernel_port() {
+        // Port 0 + auto_port used to report 0, push 0 onto the avoid list, and
+        // then scan the next listener from port 1.
+        let (_a, pa) = bind_listener_candidate(LO, 0, "a", true, &[]).unwrap();
+        let (_b, pb) = bind_listener_candidate(LO, 0, "b", true, &[pa]).unwrap();
+        assert_ne!(pa, 0);
+        assert_ne!(pb, 0);
+        assert_ne!(pa, pb);
+    }
+
+    fn hold(dir: &Path) -> std::fs::File {
+        std::fs::create_dir_all(dir).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("node.lock"))
+            .unwrap();
+        f.try_lock().unwrap();
+        f
+    }
+
+    #[test]
+    fn free_data_dir_is_kept() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("data");
+        let d = d.to_str().unwrap();
+        assert_eq!(resolve_available_data_dir(d), d);
+        // A stale lock file from a dead process is not "held".
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(Path::new(d).join("node.lock"), "12345").unwrap();
+        assert_eq!(resolve_available_data_dir(d), d);
+    }
+
+    #[test]
+    fn held_data_dir_moves_to_a_sibling() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("data");
+        let _g1 = hold(&d);
+        let _g2 = hold(&t.path().join("data-2"));
+        let ds = d.to_str().unwrap();
+        assert_eq!(resolve_available_data_dir(ds), format!("{ds}-3"));
+        // Trailing separator: the sibling must not land INSIDE the held dir.
+        assert_eq!(
+            resolve_available_data_dir(&format!("{ds}/")),
+            format!("{ds}-3")
+        );
     }
 }

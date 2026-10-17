@@ -775,9 +775,10 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         follow_symlinks_outside_root: false,
         stub_globs: Vec::new(),
         ignore: crate::ignore_rules::IgnoreOptions::default(),
-        max_file_gb: 1,
+        max_file_bytes: 1 << 30,
         sample: 50,
         no_semantic: true,
+        code_analyzer: Default::default(),
         // This module preserves legacy graph-enabled failure behavior;
         // incremental non-graph behavior has its own HTTP suite.
         brain: None,
@@ -3211,7 +3212,7 @@ fn the_resource_plan_is_announced_on_the_progress_surface_with_the_width_it_got(
 
     // Build the process-global scan pool first, so the width below is one this
     // run cannot possibly be granted.
-    let installed = crate::pool::scan_pool().current_num_threads();
+    let installed = crate::pool::width();
     let endpoint = MockEndpoint::start(usize::MAX);
     let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
     config.quiet = false;
@@ -3446,7 +3447,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
             tally: &crate::ScanTally::default(),
         },
         100,
-        1,
+        1 << 30,
         false,
     );
     assert!(scan.pdf_spool.is_none());
@@ -3535,7 +3536,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
             tally: &crate::ScanTally::default(),
         },
         100,
-        1,
+        1 << 30,
         false,
     );
 
@@ -3615,7 +3616,7 @@ fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
             tally: &crate::ScanTally::default(),
         },
         100,
-        1,
+        1 << 30,
         false,
     );
     assert!(scan.junk.is_some());

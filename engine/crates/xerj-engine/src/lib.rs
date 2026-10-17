@@ -243,7 +243,7 @@ use std::sync::Arc;
 // The create-time and settings-time gates drifted apart once already — one
 // refused four spellings, the other two — and one shared symbol is what stops
 // that (issue #204).
-pub use xerj_fts::analyzer::AnalyzerRegistry;
+pub use xerj_fts::analyzer::{AnalyzerRegistry, Token};
 use xerj_fts::analyzer::{
     LowercaseFilter, StandardTokenizer, StemmerFilter, StopwordsFilter, TokenFilter, Tokenizer,
 };

@@ -12,7 +12,7 @@
 //! whole-file dump).
 
 use crate::esclient::Es;
-use crate::search::{is_identifier, passage_text};
+use crate::search::{hit_location, is_identifier, passage_text};
 use serde_json::{json, Value};
 
 const USAGE: &str = "\
@@ -37,6 +37,53 @@ EXAMPLE:
 SEE ALSO:
     xerj search \"<plain words>\"    ranked passages when you don't know the name
 ";
+
+/// The `xerj def` query body: definition-first ranking over the per-symbol
+/// docs, narrowed by the optional `--kind` / `--lang` filters.
+fn def_query(query: &str, kind: Option<&str>, lang: Option<&str>, k: usize) -> Value {
+    // Definition-first ranking, measured at 94% correct-file-at-rank-1 on an
+    // 80-task cross-file benchmark (vs 38% for body-text search):
+    //   - `term name`: the whole query IS the identifier — keyword-exact on
+    //     the per-symbol docs, the strongest signal, boost 12.
+    //   - `match_phrase defs`: the file-level definition list; also carries
+    //     pre-#500 indexes that have no symbol docs, boost 8.
+    //   - `multi_match`: recall floor so plain-words queries ("euler angles to
+    //     rotation matrix") still surface the definer via `defs`/`code` text.
+    let mut should = vec![
+        json!({ "term": { "name": { "value": query, "boost": 12 } } }),
+        json!({ "match_phrase": { "defs": { "query": query, "boost": 8 } } }),
+        json!({ "multi_match": {
+            "query": query,
+            "fields": ["name^4", "defs^3", "code^2", "title"],
+            "type": "most_fields"
+        }}),
+    ];
+    if is_identifier(query) {
+        // `code` holds the declaration text; a phrase hit there ("def <name>(",
+        // "class <name>:") is a definition even when `name` casing differs.
+        should.push(json!({ "match_phrase": { "code": { "query": query, "boost": 4 } } }));
+    }
+    let mut filter = Vec::new();
+    if let Some(kd) = kind {
+        filter.push(json!({ "term": { "kind": kd } }));
+    }
+    if let Some(lg) = lang {
+        filter.push(json!({ "term": { "language": lg } }));
+    }
+    json!({
+        "size": k,
+        // A filter clause makes every `should` optional, so without this a
+        // `--kind`/`--lang` filter alone matches: a name defined nowhere came
+        // back as every definition of that kind instead of "no definition".
+        "query": { "bool": {
+            "should": should,
+            "filter": filter,
+            "minimum_should_match": 1
+        } },
+        "_source": ["ax_path", "path", "line", "start_line", "kind", "language", "name", "code"],
+        "fields": ["_passage"]
+    })
+}
 
 /// Entry point for the `def` subcommand. Returns a process exit code.
 pub fn run_def_cli() -> i32 {
@@ -104,41 +151,7 @@ pub fn run_def_cli() -> i32 {
         return 2;
     }
 
-    // Definition-first ranking, measured at 94% correct-file-at-rank-1 on an
-    // 80-task cross-file benchmark (vs 38% for body-text search):
-    //   - `term name`: the whole query IS the identifier — keyword-exact on
-    //     the per-symbol docs, the strongest signal, boost 12.
-    //   - `match_phrase defs`: the file-level definition list; also carries
-    //     pre-#500 indexes that have no symbol docs, boost 8.
-    //   - `multi_match`: recall floor so plain-words queries ("euler angles to
-    //     rotation matrix") still surface the definer via `defs`/`code` text.
-    let mut should = vec![
-        json!({ "term": { "name": { "value": query, "boost": 12 } } }),
-        json!({ "match_phrase": { "defs": { "query": query, "boost": 8 } } }),
-        json!({ "multi_match": {
-            "query": query,
-            "fields": ["name^4", "defs^3", "code^2", "title"],
-            "type": "most_fields"
-        }}),
-    ];
-    if is_identifier(&query) {
-        // `code` holds the declaration text; a phrase hit there ("def <name>(",
-        // "class <name>:") is a definition even when `name` casing differs.
-        should.push(json!({ "match_phrase": { "code": { "query": query, "boost": 4 } } }));
-    }
-    let mut filter = Vec::new();
-    if let Some(kd) = &kind {
-        filter.push(json!({ "term": { "kind": kd } }));
-    }
-    if let Some(lg) = &lang {
-        filter.push(json!({ "term": { "language": lg } }));
-    }
-    let body = json!({
-        "size": k,
-        "query": { "bool": { "should": should, "filter": filter } },
-        "_source": ["ax_path", "path", "line", "kind", "language", "name", "code"],
-        "fields": ["_passage"]
-    });
+    let body = def_query(&query, kind.as_deref(), lang.as_deref(), k);
 
     let pattern = format!("{prefix}-*");
     let resp = match es.search(&pattern, &body) {
@@ -174,16 +187,7 @@ pub fn run_def_cli() -> i32 {
 
     for h in &hits {
         let src = h.get("_source").cloned().unwrap_or(Value::Null);
-        let path = src
-            .get("ax_path")
-            .or_else(|| src.get("path"))
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        let line = src.get("line").and_then(Value::as_u64);
-        let loc = match line {
-            Some(n) => format!("{path}:{n}"),
-            None => path.to_string(),
-        };
+        let loc = hit_location(h);
         let kind = src.get("kind").and_then(Value::as_str).unwrap_or("");
         let tag = if kind.is_empty() {
             String::new()
@@ -211,4 +215,30 @@ pub fn run_def_cli() -> i32 {
         hits.len()
     );
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ES `bool` semantics: once a `filter` clause is present, `should`
+    /// clauses are optional unless `minimum_should_match` says otherwise. A
+    /// `--kind`/`--lang` filter must narrow the definitions of the name, not
+    /// replace the name with "anything of this kind".
+    #[test]
+    fn kind_and_lang_filters_still_require_the_name_to_match() {
+        for (kind, lang) in [
+            (Some("function"), None),
+            (None, Some("python")),
+            (Some("class"), Some("rust")),
+            (None, None),
+        ] {
+            let body = def_query("zzqq_nonexistent", kind, lang, 5);
+            let b = &body["query"]["bool"];
+            assert_eq!(b["minimum_should_match"], 1, "{body}");
+            assert!(!b["should"].as_array().unwrap().is_empty());
+            let filters = b["filter"].as_array().unwrap().len();
+            assert_eq!(filters, kind.is_some() as usize + lang.is_some() as usize);
+        }
+    }
 }

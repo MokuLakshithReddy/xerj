@@ -64,7 +64,9 @@ jobs:
       # (and nothing else). Any code/CI/other-docs change re-arms the full gate.
       # The binding `verification/cla-signed` status for a field-report-only PR
       # is provided separately (.github/workflows/cla-field-report-exempt.yml),
-      # because cla-bot cannot path-scope itself.
+      # because cla-bot cannot path-scope itself. A rename also emits its source
+      # path (previous_filename), so renaming a code file into the field-report
+      # folder cannot hide its deletion from the carve-out.
       - name: Co-authored-by trailers resolve to signed contributors
         if: github.event_name == 'pull_request'
         env:
@@ -72,7 +74,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          FILES="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"
+          FILES="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[] | .filename, (.previous_filename // empty)')"
           python3 scripts/check_cla_coauthors.py --pr "$PR_NUMBER" --changed-files "$FILES"
 
   reference-coding:
