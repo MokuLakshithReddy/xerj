@@ -15,7 +15,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use xerj_common::localauth::{discover_local_admin_key, url_is_loopback};
+use xerj_common::localauth::{discover_local_admin_key_for_url, url_is_loopback};
 use xerj_common::xccode::{self, manifest, state, CodeOutcome, CodeParams, Mode, XcHttp};
 
 use crate::esclient::{Count, Es};
@@ -30,8 +30,9 @@ pub fn code_root() -> PathBuf {
             return PathBuf::from(home);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".xerj-code")
+    xerj_common::home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".xerj-code")
 }
 
 /// `--url` flag > `XERJ_URL` > `http://localhost:9200`. Unlike `autoindex`
@@ -54,7 +55,7 @@ fn build_es(url: &str, api_key: Option<String>) -> Result<Es> {
                 Some(k) => Some(k),
                 None => {
                     if url_is_loopback(url) {
-                        discover_local_admin_key().map(|(k, path)| {
+                        discover_local_admin_key_for_url(url).map(|(k, path)| {
                             eprintln!(
                                 "xerj code: no --api-key/XERJ_API_KEY given; using the admin \
                                  key at {}",
@@ -112,8 +113,8 @@ fn emit(out: &CodeOutcome) {
 
 const CODE_USAGE: &str =
     "usage: xerj code <corpus> \"<what you need>\" [-k N] [--mode bm25|semantic|hybrid]
-       [--hybrid] [--lang <lg>] [--full N] [--no-symbol] [--json] [--meatl] [--stale-ok]
-       [--url URL] [--api-key KEY]
+       [--hybrid] [--lang <lg>] [--full N] [--no-symbol] [--fuse-symbols]
+       [--json] [--meatl] [--stale-ok] [--url URL] [--api-key KEY]
 
 retrieval over a reference corpus (see `xerj corpus list`):
   -k N            passages to return (default 5)
@@ -122,6 +123,7 @@ retrieval over a reference corpus (see `xerj corpus list`):
   --lang LG       filter to one language field (e.g. rust, go)
   --full N        max chars per passage (default 800; 0 = file head only)
   --no-symbol     window selection instead of the matching definition
+  --fuse-symbols  fuse file-level BM25 with symbol-impl BM25 by RRF(k=60)
   --json          raw server response on stdout
   --meatl         machine-readable one-line-per-hit output
   --stale-ok      override the 30-day staleness refusal
@@ -183,6 +185,7 @@ pub fn run_code_cli(args: &[String]) -> i32 {
                 }
             }
             "--no-symbol" => p.no_symbol = true,
+            "--fuse-symbols" => p.fuse_symbols = true,
             "--json" => p.as_json = true,
             "--meatl" => p.meatl = true,
             "--stale-ok" => p.stale_ok = true,
@@ -231,6 +234,7 @@ const CORPUS_USAGE: &str =
        xerj corpus index <name> [--fresh] [--url URL]
        xerj corpus list [--url URL]
 
+a flag may precede the verb (xerj corpus --url URL index <name>);
 clone the repos, detect licences, write corpora/<name>/corpus.json;
 --from takes the corpus name from the manifest's 'corpus' field (or the
 pack's 'pack' field) unless <name> or --as overrides it; a harvested pack
@@ -1262,14 +1266,53 @@ fn delete_indices(node: &dyn CorpusNode, names: &[String]) -> usize {
     failed
 }
 
-fn report(name: &str, rc: i32, docs: &str) {
+/// The terminal verdict lines, as a pure function so the footer can be
+/// asserted on (the live failures on this path were all about what the LAST
+/// line claims). `rc` is the autoindex exit the flow carried in:
+///
+/// - 0 / 3 are the clean outcomes (3 = some files skipped as junk, normal for
+///   real repos) — the store verified, so "searchable: N records" is earned.
+/// - any other `rc` only reaches here through a #367 salvage: autoindex
+///   aborted in finalisation but the written store passed the verification
+///   search, so it is kept and queryable. It is NOT a clean build. An aborted
+///   run that prints the plain `searchable: N records` success footer is the
+///   last live half of #1183's dishonest-resume item: the 2026-10-08 standing
+///   rebuild ended `xerj-done ok=false exit=1 reason=aborted` and still
+///   printed `corpus 'xerj-search' searchable: 1011181 records`, overstating
+///   the kept set by the 348 docs the re-walk had just dropped. A salvaged
+///   build says so, and never the word "searchable".
+fn report_footer(name: &str, rc: i32, docs: &str) -> Vec<String> {
     match rc {
-        0 => println!("indexed cleanly"),
-        3 => println!("indexed (exit 3: some files skipped as junk — normal for real repos)"),
-        _ => {}
+        0 | 3 => {
+            let head = if rc == 0 {
+                "indexed cleanly".to_string()
+            } else {
+                "indexed (exit 3: some files skipped as junk — normal for real repos)".to_string()
+            };
+            vec![
+                head,
+                format!("corpus '{name}' searchable: {docs} records"),
+                format!("next: xerj code {name} \"<what you need>\""),
+            ]
+        }
+        _ => vec![
+            format!(
+                "corpus '{name}' indexed with errors (autoindex exit {rc}): {docs} records \
+                 are present and queryable, but coverage is NOT guaranteed — read the error \
+                 above before relying on this corpus."
+            ),
+            format!(
+                "next: xerj code {name} \"<what you need>\"  (verify coverage first; a clean \
+                 rebuild is `xerj corpus index {name} --fresh`)"
+            ),
+        ],
     }
-    println!("corpus '{name}' searchable: {docs} records");
-    println!("next: xerj code {name} \"<what you need>\"");
+}
+
+fn report(name: &str, rc: i32, docs: &str) {
+    for line in report_footer(name, rc, docs) {
+        println!("{line}");
+    }
 }
 
 fn run_corpus_index(args: &[String]) -> i32 {
@@ -1953,7 +1996,17 @@ fn run_corpus_list(args: &[String]) -> i32 {
 // ── dispatch ────────────────────────────────────────────────────────────────
 
 /// `xerj corpus <add|build|index|list> …` — returns the process exit code.
+fn corpus_verb(arg: &str) -> bool {
+    matches!(
+        arg,
+        "add" | "build" | "sign" | "keygen" | "index" | "list" | "help" | "-h" | "--help"
+    )
+}
+
 pub fn run_corpus_cli(args: &[String]) -> i32 {
+    // `xerj corpus --url URL index <name>`: the verb is not the first token.
+    let promoted = xerj_common::argv::reorder_flags_before_command(args, corpus_verb);
+    let args: &[String] = promoted.as_deref().unwrap_or(args);
     let Some(sub) = args.first() else {
         eprintln!("{CORPUS_USAGE}");
         return 2;
@@ -1984,6 +2037,14 @@ pub fn licence_map_for(root: &Path, corpus: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flag_before_the_corpus_verb_is_not_an_unknown_subcommand() {
+        // Before the hoist, `--url` was the verb and this returned 2
+        // ("unknown subcommand"). `--help` is the verb; it must run.
+        let code = run_corpus_cli(&["--url".into(), "http://127.0.0.1:9".into(), "--help".into()]);
+        assert_eq!(code, 0);
+    }
 
     #[test]
     fn corpus_names_are_gated_before_any_path_is_built() {
@@ -2744,6 +2805,49 @@ mod tests {
         assert_ne!(st.autoindex_exit, Some(serde_json::json!(1)));
         // and the probe ran, over exactly the glob `xerj code` reads
         assert!(node.ops.borrow().iter().any(|o| *o == "search:xc-kv-*"));
+    }
+
+    /// #1183, the last live half of the dishonest-resume item: a run that
+    /// aborted (autoindex exit ∉ {0,3}) and was only KEPT by the #367 salvage
+    /// must not print the clean `searchable: N records` success footer. The
+    /// 2026-10-08 standing rebuild ended `xerj-done ok=false exit=1
+    /// reason=aborted` and still printed `corpus 'xerj-search' searchable:
+    /// 1011181 records`, overstating the kept set by the 348 docs the re-walk
+    /// had just dropped.
+    #[test]
+    fn the_searchable_footer_is_never_printed_after_an_aborted_run() {
+        // clean exits keep the earned "searchable" footer and the next-hint
+        for rc in [0, 3] {
+            let lines = report_footer("kv", rc, "500");
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l == "corpus 'kv' searchable: 500 records"),
+                "rc {rc} is clean and earns the searchable footer: {lines:?}"
+            );
+            assert!(lines.iter().any(|l| l.starts_with("next: xerj code kv")));
+        }
+        // a salvaged/aborted run (any other exit) says so and NEVER prints the
+        // word "searchable" — the whole defect in one assertion
+        for rc in [1, 2, 134] {
+            let lines = report_footer("kv", rc, "500");
+            assert!(
+                lines.iter().all(|l| !l.contains("searchable")),
+                "an aborted run (exit {rc}) must not print the searchable footer: {lines:?}"
+            );
+            // it still tells the operator the kept store exists, names the
+            // exit, and points at the clean rebuild — honest, not silent
+            assert!(
+                lines.iter().any(|l| l.contains("indexed with errors")
+                    && l.contains(&format!("autoindex exit {rc}"))
+                    && l.contains("coverage is NOT guaranteed")),
+                "the aborted footer must name the fault: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("--fresh")),
+                "the aborted footer points at the clean rebuild: {lines:?}"
+            );
+        }
     }
 
     /// #1173: the three honest claims a failed legacy run can make. The one

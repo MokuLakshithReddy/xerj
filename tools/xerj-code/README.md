@@ -150,7 +150,7 @@ The contracts live where the code lives, gated by scoped cargo tests (run from
 
 ```sh
 cargo test --profile ci-test -p xerj-common xccode    # staleness, licences, exit triangle, hybrid shape, passages, ledger
-cargo test --profile ci-test -p xerj-autoindex xc_    # corpus lifecycle, path gate, usage
+cargo test --profile ci-test -p xerj-autoindex xc::   # corpus lifecycle, path gate, usage
 cargo test --profile ci-test -p xerj-mcp              # tool schema presence + isError mapping
 cargo test --profile ci-test -p xerj-common xccode::manifest   # hub manifests pass the untrusted-input gate
 ```

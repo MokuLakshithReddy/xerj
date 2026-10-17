@@ -25,7 +25,7 @@ use serde_json::json;
 use std::time::Instant;
 use tempfile::TempDir;
 use xerj_common::config::Config;
-use xerj_common::types::Schema;
+use xerj_common::types::{FieldConfig, FieldType, Schema};
 use xerj_engine::aggs::fast_path_aggs_served;
 use xerj_engine::{Engine, Index};
 use xerj_query::parse_request;
@@ -45,6 +45,25 @@ fn make_engine(dir: &TempDir) -> Engine {
     let mut config = Config::default();
     config.server.data_dir = dir.path().to_str().unwrap().to_string();
     Engine::new(config).expect("engine::new")
+}
+
+/// Declare the exact-match fields this verify-shape reads as `keyword`, the
+/// way the real crawl's data index and the autoindex catalog declare theirs
+/// (`ax_file` is a content digest, `ax_dataset` a dataset name, `cve_id` an
+/// identifier — all keyword, never analysed text). These tests used
+/// `Schema::empty()`, so since #1329 those fields became `text` parents with
+/// NO doc-values column; the columnar count-lane (terms on `ax_file`) and the
+/// `KwExists` arm both read that column, so the window fell to the brute path
+/// and the "served columnar" assertions failed. `text` is declared keyword
+/// too so the `exists` arm has a column to read — a declared keyword carries
+/// no `ignore_above` by default, so the ~1 KB record body is still stored
+/// whole (presence is all `exists` reads).
+fn kw_schema(fields: &[&str]) -> Schema {
+    let mut s = Schema::empty();
+    for f in fields {
+        s.fields.push(FieldConfig::new(*f, FieldType::Keyword));
+    }
+    s
 }
 
 async fn run(idx: &std::sync::Arc<Index>, body: serde_json::Value) -> serde_json::Value {
@@ -131,7 +150,12 @@ async fn count_lane_full_window_is_served_columnar() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("cves28", Schema::empty()).unwrap();
+    engine
+        .create_index(
+            "cves28",
+            kw_schema(&["ax_file", "ax_dataset", "cve_id", "text"]),
+        )
+        .unwrap();
     let idx = engine.get_index("cves28").unwrap();
     let digests = seed(&idx).await;
 
@@ -180,7 +204,12 @@ async fn count_lane_with_resident_ghosts_is_served_and_exact() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("cves28g", Schema::empty()).unwrap();
+    engine
+        .create_index(
+            "cves28g",
+            kw_schema(&["ax_file", "ax_dataset", "cve_id", "text"]),
+        )
+        .unwrap();
     let idx = engine.get_index("cves28g").unwrap();
     let digests = seed(&idx).await;
 
@@ -272,7 +301,9 @@ async fn doc_lane_window_fetch_is_bounded() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("catalog", Schema::empty()).unwrap();
+    engine
+        .create_index("catalog", kw_schema(&["file_key", "run_id", "ax_path"]))
+        .unwrap();
     let idx = engine.get_index("catalog").unwrap();
     // The catalog holds ONE doc per (digest, alias) — seed the same digests
     // plus a run_id that matches everything (the resume-rewrote-everything

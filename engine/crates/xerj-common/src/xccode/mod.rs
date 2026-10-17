@@ -90,6 +90,9 @@ pub struct CodeParams {
     /// issue #368, so this is a cap, never an opt-out).
     pub full: usize,
     pub no_symbol: bool,
+    /// #1237: opt-in second BM25 leg over symbol-record `impl` fields, fused
+    /// with file-level BM25 at the file level by RRF(k=60).
+    pub fuse_symbols: bool,
     pub stale_ok: bool,
     pub meatl: bool,
     /// CLI `--json`: raw server response on stdout. MCP never sets this.
@@ -110,6 +113,7 @@ impl CodeParams {
             mode: Mode::Bm25,
             full: 800,
             no_symbol: false,
+            fuse_symbols: false,
             stale_ok: false,
             meatl: false,
             as_json: false,
@@ -238,6 +242,18 @@ pub fn run_code_query(
     let pattern = format!("{prefix}*");
     let mapping = http.get_mapping(&format!("/{pattern}/_mapping")).ok();
     let mut fields = fields::resolve_fields(mapping.as_ref());
+    if fields.is_empty() {
+        // resolve_fields returns empty only when every candidate, including
+        // `body`, is numeric on some index. Sending the historical floor
+        // would be the #1284 rejection.
+        return CodeOutcome::refused(
+            format!(
+                "no text field under '{pattern}' can take this query — a mapped \
+                 field is numeric, and a text query against it is rejected"
+            ),
+            2,
+        );
+    }
     // #1254: a corpus may DECLARE the weight of its `text` recall leg. The
     // 0.5 default is the #1238 calibration, measured on the live exploit
     // group where `text` carries sibling-CVE mirror demos that must not
@@ -265,6 +281,9 @@ pub fn run_code_query(
 
     let mut note: Option<String> = None;
     let mut rrf_scores = false;
+    // Any leg that comes back `timed_out` makes the page partial. The flag is
+    // on the JSON body (HTTP 200), so it is invisible unless we read it.
+    let mut deadline_hit = false;
 
     // #1137: fetch deeper than the page so the per-file cap has candidates
     // to draw on; the page is cut back to `params.k` after diversification.
@@ -273,7 +292,39 @@ pub fn run_code_query(
     let (mut resp, hits) = match params.mode {
         Mode::Bm25 => match http.search(&pattern, &bm25_body(&query, fetch, &params.lang, &fields))
         {
-            Ok(r) => (r.clone(), hit_list(&r)),
+            Ok(mut r) => {
+                note_deadline(&r, &mut deadline_hit);
+                let mut h = hit_list(&r);
+                if params.fuse_symbols
+                    && !params.no_symbol
+                    && fields::has_symbol_impl(mapping.as_ref())
+                {
+                    if let Ok(sym_resp) =
+                        http.search(&pattern, &symbol_bm25_body(&query, fetch, &params.lang))
+                    {
+                        note_deadline(&sym_resp, &mut deadline_hit);
+                        let sym_hits = hit_list(&sym_resp);
+                        if !sym_hits.is_empty() {
+                            h = fuse_file_and_symbol_hits(
+                                http,
+                                &pattern,
+                                h,
+                                sym_hits,
+                                fetch,
+                                &mut deadline_hit,
+                            );
+                            if let Some(hits_arr) =
+                                r.pointer_mut("/hits/hits").and_then(Value::as_array_mut)
+                            {
+                                *hits_arr = h.clone();
+                            }
+                            rrf_scores = true;
+                            note = Some(format!("BM25 file+symbol RRF(k={RRF_K})"));
+                        }
+                    }
+                }
+                (r, h)
+            }
             Err(e) => return CodeOutcome::refused(format!("search failed: {e}"), 2),
         },
         Mode::Semantic => {
@@ -288,27 +339,47 @@ pub fn run_code_query(
                     )
                 }
             };
-            let (capable, total) = fields::semantic_capable(Some(&mapping));
-            if capable.is_empty() {
+            // Group by the field each index actually embeds. One request
+            // cannot name two semantic fields, and naming `body` at an index
+            // whose embedded field is `code` or `text` 400s every index in
+            // the comma-join.
+            let (groups, total) = fields::semantic_groups(Some(&mapping));
+            if groups.is_empty() {
                 // No semantic arm is possible: do NOT post the query. An
                 // empty comma-join is an empty index segment, which the
                 // server reads as `/_search` — every index on the node,
                 // corpus or not. The empty answer with its note is the
                 // honest result.
                 note = Some(format!(
-                    "no index under '{pattern}' maps `body` as semantic_text"
+                    "no index under '{pattern}' maps a field as semantic_text"
                 ));
                 (Value::Null, Vec::new())
             } else {
+                let indexed: usize = groups.iter().map(|(_, names)| names.len()).sum();
+                let described = groups
+                    .iter()
+                    .map(|(field, names)| format!("{field} ({})", names.len()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 note = Some(format!(
-                    "vector only over {} of {total} index(es)",
-                    capable.len()
+                    "vector only over {indexed} of {total} index(es): {described}"
                 ));
-                let body = semantic_body(&query, fetch, &params.lang);
-                match http.search(&capable.join(","), &body) {
-                    Ok(r) => (r.clone(), hit_list(&r)),
-                    Err(e) => return CodeOutcome::refused(format!("search failed: {e}"), 2),
+                let mut merged: Option<Value> = None;
+                for (field, names) in &groups {
+                    let body = semantic_on_field(field, &query, fetch, &params.lang);
+                    match http.search(&names.join(","), &body) {
+                        Ok(response) => {
+                            note_deadline(&response, &mut deadline_hit);
+                            merged = Some(match merged {
+                                Some(prev) => merge_by_score(prev, &response, fetch),
+                                None => response,
+                            });
+                        }
+                        Err(e) => return CodeOutcome::refused(format!("search failed: {e}"), 2),
+                    }
                 }
+                let response = merged.unwrap_or(Value::Null);
+                (response.clone(), hit_list(&response))
             }
         }
         Mode::Hybrid => {
@@ -320,7 +391,10 @@ pub fn run_code_query(
                      discovered under '{pattern}'"
                 ));
                 match http.search(&pattern, &bm25_body(&query, fetch, &params.lang, &fields)) {
-                    Ok(r) => (r.clone(), hit_list(&r)),
+                    Ok(r) => {
+                        note_deadline(&r, &mut deadline_hit);
+                        (r.clone(), hit_list(&r))
+                    }
                     Err(e) => return CodeOutcome::refused(format!("search failed: {e}"), 2),
                 }
             } else {
@@ -328,7 +402,12 @@ pub fn run_code_query(
                 // neighbours for ANY input, so a BM25 miss is the corpus's
                 // only honest "no" — vector hits must not launder it.
                 match http.search(&pattern, &bm25_body(&query, 1, &params.lang, &fields)) {
-                    Ok(pre) if hit_list(&pre).is_empty() => {
+                    Ok(pre)
+                        if {
+                            note_deadline(&pre, &mut deadline_hit);
+                            hit_list(&pre).is_empty()
+                        } =>
+                    {
                         note = Some(
                             "no lexical match in this corpus — vector nearest-neighbours \
                              are not evidence of a match, so this is reported as a miss"
@@ -336,7 +415,8 @@ pub fn run_code_query(
                         );
                         (Value::Null, Vec::new())
                     }
-                    Ok(_) => {
+                    Ok(pre) => {
+                        note_deadline(&pre, &mut deadline_hit);
                         // The engine's native top-level `hybrid` (RRF k=60) —
                         // no client-side fusion. Aimed at the comma-joined
                         // CAPABLE set when only some indices map `body` as
@@ -350,6 +430,7 @@ pub fn run_code_query(
                         let body = hybrid_body(&query, fetch, &params.lang, &fields);
                         match http.search(&target, &body) {
                             Ok(r) => {
+                                note_deadline(&r, &mut deadline_hit);
                                 rrf_scores = true;
                                 let mut n = format!(
                                     "hybrid RRF(k={RRF_K}) — BM25 over {total} index(es), \
@@ -386,6 +467,7 @@ pub fn run_code_query(
                                         hybrid_bm25_leg_body(&query, fetch, &params.lang, &fields);
                                     match http.search(&lexical_only.join(","), &lex_body) {
                                         Ok(lex) => {
+                                            note_deadline(&lex, &mut deadline_hit);
                                             n.push_str(&format!(
                                                 "; lexical-only (BM25 leg only, merged by \
                                                  score): {}",
@@ -417,7 +499,10 @@ pub fn run_code_query(
                                     &pattern,
                                     &bm25_body(&query, fetch, &params.lang, &fields),
                                 ) {
-                                    Ok(r) => (r.clone(), hit_list(&r)),
+                                    Ok(r) => {
+                                        note_deadline(&r, &mut deadline_hit);
+                                        (r.clone(), hit_list(&r))
+                                    }
                                     Err(e) => {
                                         return CodeOutcome::refused(
                                             format!("search failed: {e}"),
@@ -434,11 +519,30 @@ pub fn run_code_query(
         }
     };
 
+    // #1504: a vector leg ran. The note already says how many indices it
+    // covered; it did not say which embedder produced the vectors. The
+    // default is lexical feature-hashing, and a caller who read "vector
+    // over N of M" has guessed neural before. The line states the default
+    // and the flag that changes it. It does not claim the running node is
+    // or is not on that default — the client cannot see `--embed-mode`.
+    if let Some(n) = note.as_mut() {
+        if n.contains("vector over") || n.contains("vector only") {
+            n.push_str(
+                "; vector leg uses the node's embedder (default is lexical \
+                 feature-hashing, not neural — start the node with --embed-mode neural \
+                 for the built-in BERT)",
+            );
+        }
+    }
+
     // 5. #1137: cut the overfetched window back to the page, capping records
     //    per source file (#1137) and per source index (#1238), and patch the
     //    diversified page into the response so `--json` consumers see the
     //    SAME list the prose renderer does (the G7 grader is one). A page
     //    that shrank says so in the note, naming only the caps that fired.
+    // #1504: translation catalogs and minified bundles repeat every UI phrase
+    // and win natural-language queries. They stay searchable, behind source.
+    let hits = demote_catalog_noise(hits);
     let (hits, file_dropped, index_dropped) = diversify(hits, params.k);
     if file_dropped > 0 || index_dropped > 0 {
         let mut caps = Vec::new();
@@ -457,6 +561,21 @@ pub fn run_code_query(
             Some(n) => format!("{n}; {cap}"),
             None => cap,
         });
+    }
+    // A missed deadline is HTTP 200 with a prefix of the ranking. Say so on
+    // every surface: stderr warnings, the prose the CLI prints, and the JSON
+    // body (`timed_out`, the same field the node set). Exit stays 0 when
+    // there are hits — the page is partial, not a transport failure.
+    if deadline_hit {
+        warnings.push(DEADLINE_WARNING.to_string());
+        match resp.as_object_mut() {
+            Some(obj) => {
+                obj.insert("timed_out".into(), Value::Bool(true));
+            }
+            None => {
+                resp = serde_json::json!({"timed_out": true, "hits": {"hits": []}});
+            }
+        }
     }
     if params.as_json {
         if let Some(hits_arr) = resp.pointer_mut("/hits/hits").and_then(Value::as_array_mut) {
@@ -515,6 +634,25 @@ pub fn run_code_query(
     }
 }
 
+/// The engine answers a missed search deadline with HTTP 200, the hits it
+/// gathered, and `timed_out: true`. A caller that only reads `hits` reports
+/// that prefix as the whole ranking.
+pub(crate) fn response_timed_out(resp: &Value) -> bool {
+    resp.get("timed_out") == Some(&Value::Bool(true))
+}
+
+fn note_deadline(resp: &Value, deadline_hit: &mut bool) {
+    if response_timed_out(resp) {
+        *deadline_hit = true;
+    }
+}
+
+/// What `xerj code` says when the node stopped early. Kept in one place so
+/// the prose warning and the regression test cannot drift.
+pub(crate) const DEADLINE_WARNING: &str = "\
+search deadline hit: the node returned HTTP 200 with timed_out true and a partial \
+hit list. These are the hits gathered before the deadline, not a complete ranking.";
+
 /// Hits of a search response, missing containers tolerated as empty.
 pub(crate) fn hit_list(resp: &Value) -> Vec<Value> {
     resp.pointer("/hits/hits")
@@ -558,6 +696,67 @@ pub(crate) fn diversity_fetch(k: usize) -> usize {
 /// they are: a corpus whose whole fan-out is a handful of shard indices
 /// (the blogposts pack is 4) has fewer indices than slots, the per-index
 /// cap would only shrink the page, and so it never engages.
+/// Stable partition: hits whose path is a translation catalog or a minified
+/// bundle move behind every other hit, keeping their relative order. A page
+/// that is only catalogs is unchanged. Hits with no path stay where they are.
+pub(crate) fn demote_catalog_noise(hits: Vec<Value>) -> Vec<Value> {
+    let mut primary = Vec::with_capacity(hits.len());
+    let mut catalogs = Vec::new();
+    for hit in hits {
+        if hit_path(&hit).is_some_and(is_catalog_noise) {
+            catalogs.push(hit);
+        } else {
+            primary.push(hit);
+        }
+    }
+    primary.extend(catalogs);
+    primary
+}
+
+/// Translation catalogs and minified bundles (#1504). The patterns are the
+/// ones a multilingual repo uses for key→string tables, not a general
+/// "prose file" filter: `lang/*.php`, `values*/strings.xml`, `*.lproj/*.strings`,
+/// `*.po` / `*.pot`, and `*.min.js` / `*.min.mjs` / `*.min.css`.
+pub(crate) fn is_catalog_noise(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if name.ends_with(".min.js") || name.ends_with(".min.mjs") || name.ends_with(".min.css") {
+        return true;
+    }
+    if name.ends_with(".po") || name.ends_with(".pot") {
+        return true;
+    }
+    let Some(parent) = parent_segment(path) else {
+        return false;
+    };
+    if parent == "lang" && name.ends_with(".php") {
+        return true;
+    }
+    if name == "strings.xml" && (parent == "values" || parent.starts_with("values-")) {
+        return true;
+    }
+    parent.ends_with(".lproj") && name.ends_with(".strings")
+}
+
+fn parent_segment(path: &str) -> Option<&str> {
+    let cut = path.rfind(['/', '\\'])?;
+    let head = &path[..cut];
+    let start = head.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    let parent = &head[start..];
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
+fn hit_path(hit: &Value) -> Option<&str> {
+    hit.pointer("/_source/ax_path")
+        .and_then(Value::as_str)
+        .or_else(|| hit.pointer("/_source/ax_file").and_then(Value::as_str))
+        .or_else(|| hit.pointer("/_source/path").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+}
+
 pub(crate) fn diversify(hits: Vec<Value>, want: usize) -> (Vec<Value>, usize, usize) {
     // Keys are owned: a borrowed &str would pin every hit it came from and
     // forbid the move into `out` below.
@@ -629,13 +828,250 @@ pub(crate) fn bm25_body(query: &str, k: usize, lang: &Option<String>, fields: &[
     serde_json::json!({ "size": k, "query": { "bool": { "must": must } } })
 }
 
-/// The vector-only body. Aimed ONLY at indices whose `body` is semantic_text
-/// (a semantic query against plain text 400s the whole wildcard).
+/// #1237: second BM25 leg over symbol-record `impl` fields. Excludes `impl`
+/// and `body` from `_source` so the symbol leg never transfers symbol body
+/// text over the wire — only provenance (`ax_path`, `ax_file`, `path`) and
+/// the winning symbol span (`name`, `kind`, `line`, `end_line`).
+pub(crate) fn symbol_bm25_body(query: &str, k: usize, lang: &Option<String>) -> Value {
+    let mut must = vec![serde_json::json!({
+        "multi_match": { "query": query, "fields": ["impl"] }
+    })];
+    if let Some(lg) = lang {
+        must.push(serde_json::json!({ "match": { "language": lg } }));
+    }
+    serde_json::json!({
+        "size": k,
+        "_source": { "excludes": ["impl", "body"] },
+        "query": { "bool": { "must": must } }
+    })
+}
+
+fn hit_file_key(hit: &Value) -> Option<String> {
+    hit.pointer("/_source/ax_path")
+        .and_then(Value::as_str)
+        .or_else(|| hit.pointer("/_source/ax_file").and_then(Value::as_str))
+        .or_else(|| hit.pointer("/_source/path").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// #1237: roll both BM25 legs up to the file level first (each file gets its
+/// best 1-indexed file-leg rank and its best 1-indexed symbol-leg rank so a
+/// file with ten matching functions does not get ten RRF votes), fuse by
+/// `1 / (60 + rank_file) + 1 / (60 + rank_sym)`, and stamp the winning
+/// symbol's `line..=end_line` onto `_source.symbols` for passage selection.
+pub(crate) fn fuse_file_and_symbol_hits(
+    http: &impl XcHttp,
+    pattern: &str,
+    file_hits: Vec<Value>,
+    sym_hits: Vec<Value>,
+    limit: usize,
+    deadline_hit: &mut bool,
+) -> Vec<Value> {
+    struct FileEntry {
+        file_rank: Option<usize>,
+        sym_rank: Option<usize>,
+        file_hit: Option<Value>,
+        sym_hit: Option<Value>,
+        win_sym: Option<(String, String, i64, Option<i64>)>,
+    }
+
+    let mut by_file: HashMap<String, FileEntry> = HashMap::new();
+    let mut unkeyed: Vec<Value> = Vec::new();
+    let mut next_file_rank = 0usize;
+
+    for hit in file_hits {
+        let Some(key) = hit_file_key(&hit) else {
+            unkeyed.push(hit);
+            continue;
+        };
+        let has_body = hit
+            .pointer("/_source/body")
+            .and_then(Value::as_str)
+            .is_some();
+        let entry = by_file.entry(key).or_insert_with(|| {
+            next_file_rank += 1;
+            FileEntry {
+                file_rank: Some(next_file_rank),
+                sym_rank: None,
+                file_hit: None,
+                sym_hit: None,
+                win_sym: None,
+            }
+        });
+        if entry.file_hit.is_none()
+            || (has_body
+                && entry
+                    .file_hit
+                    .as_ref()
+                    .and_then(|h| h.pointer("/_source/body"))
+                    .and_then(Value::as_str)
+                    .is_none())
+        {
+            entry.file_hit = Some(hit);
+        }
+    }
+
+    let mut next_sym_rank = 0usize;
+    for hit in sym_hits {
+        let Some(key) = hit_file_key(&hit) else {
+            continue;
+        };
+        let sym_span = hit.get("_source").and_then(|src| {
+            let name = src.get("name")?.as_str()?.to_string();
+            let line = src.get("line")?.as_i64()?;
+            let kind = src
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let end_line = src
+                .get("end_line")
+                .and_then(Value::as_i64)
+                .filter(|&e| e >= line);
+            Some((name, kind, line, end_line))
+        });
+        let entry = by_file.entry(key).or_insert_with(|| FileEntry {
+            file_rank: None,
+            sym_rank: None,
+            file_hit: None,
+            sym_hit: None,
+            win_sym: None,
+        });
+        if entry.sym_rank.is_none() {
+            next_sym_rank += 1;
+            entry.sym_rank = Some(next_sym_rank);
+            entry.sym_hit = Some(hit);
+            entry.win_sym = sym_span;
+        }
+    }
+
+    let mut ranked: Vec<(String, f64, usize, FileEntry)> = by_file
+        .into_iter()
+        .map(|(key, entry)| {
+            let f_score = entry
+                .file_rank
+                .map(|r| 1.0 / (RRF_K as f64 + r as f64))
+                .unwrap_or(0.0);
+            let s_score = entry
+                .sym_rank
+                .map(|r| 1.0 / (RRF_K as f64 + r as f64))
+                .unwrap_or(0.0);
+            let best_rank = entry
+                .file_rank
+                .unwrap_or(usize::MAX)
+                .min(entry.sym_rank.unwrap_or(usize::MAX));
+            (key, f_score + s_score, best_rank, entry)
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(limit);
+
+    let mut out = Vec::with_capacity(ranked.len());
+    for (key, score, _, mut entry) in ranked {
+        let has_body = entry
+            .file_hit
+            .as_ref()
+            .and_then(|h| h.pointer("/_source/body"))
+            .and_then(Value::as_str)
+            .is_some();
+        if !has_body {
+            // File entered via the symbol leg alone: fetch its file record so
+            // passage selection has `body` to slice.
+            let lookup = serde_json::json!({
+                "size": 1,
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "exists": { "field": "body" } },
+                            { "match_phrase": { "ax_path": key } }
+                        ]
+                    }
+                }
+            });
+            let target = entry
+                .sym_hit
+                .as_ref()
+                .and_then(|h| h.get("_index"))
+                .and_then(Value::as_str)
+                .unwrap_or(pattern);
+            if let Ok(resp) = http.search(target, &lookup) {
+                note_deadline(&resp, deadline_hit);
+                if let Some(fetched) = hit_list(&resp)
+                    .into_iter()
+                    .find(|h| hit_file_key(h).as_deref() == Some(key.as_str()))
+                {
+                    entry.file_hit = Some(fetched);
+                }
+            }
+        }
+        let Some(mut hit) = entry.file_hit.or(entry.sym_hit) else {
+            continue;
+        };
+        if let Some((name, kind, line, end_line)) = entry.win_sym {
+            if let Some(src) = hit.get_mut("_source").and_then(Value::as_object_mut) {
+                let syms = src
+                    .entry("symbols")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(arr) = syms.as_array_mut() {
+                    let mut updated = false;
+                    for s in arr.iter_mut() {
+                        if s.get("name").and_then(Value::as_str) == Some(name.as_str())
+                            && s.get("line").and_then(Value::as_i64) == Some(line)
+                        {
+                            if let (Some(obj), Some(end)) = (s.as_object_mut(), end_line) {
+                                obj.insert("end_line".to_string(), serde_json::json!(end));
+                            }
+                            updated = true;
+                            break;
+                        }
+                    }
+                    if !updated {
+                        let mut sym_obj = serde_json::Map::new();
+                        sym_obj.insert("name".to_string(), Value::String(name));
+                        sym_obj.insert("kind".to_string(), Value::String(kind));
+                        sym_obj.insert("line".to_string(), serde_json::json!(line));
+                        if let Some(end) = end_line {
+                            sym_obj.insert("end_line".to_string(), serde_json::json!(end));
+                        }
+                        arr.push(Value::Object(sym_obj));
+                    }
+                }
+            }
+        }
+        if let Some(obj) = hit.as_object_mut() {
+            obj.insert("_score".to_string(), serde_json::json!(score));
+        }
+        out.push(hit);
+    }
+    for hit in unkeyed {
+        if out.len() >= limit {
+            break;
+        }
+        out.push(hit);
+    }
+    out
+}
+
+/// The vector-only body aimed at `field`. A semantic query against a plain
+/// `text` field 400s the whole request, so callers pass only indices that
+/// embed this field. Hybrid still hardcodes `body`; semantic mode passes
+/// the field [`fields::semantic_groups`] elected.
 ///
 /// The clause carries `k` = the fetch window: without it the parser cuts the
 /// vector pool to 10 whatever `size` says (#1145).
-pub(crate) fn semantic_body(query: &str, k: usize, lang: &Option<String>) -> Value {
-    let q = serde_json::json!({ "semantic": { "field": "body", "query": query, "k": k } });
+pub(crate) fn semantic_on_field(
+    field: &str,
+    query: &str,
+    k: usize,
+    lang: &Option<String>,
+) -> Value {
+    let q = serde_json::json!({ "semantic": { "field": field, "query": query, "k": k } });
     // `--lang` rides in `filter`: the engine sends a bool to the vector path
     // only when the semantic clause is its sole must/should clause (#1148).
     let query = match lang {
@@ -798,6 +1234,9 @@ mod tests {
         fail_search: bool,
         // Per-target answers (#1146); a target not listed gets `hits`.
         hits_by_target: HashMap<String, Vec<Value>>,
+        /// The node stopped at its deadline: HTTP 200, `timed_out: true`,
+        /// and only the hits gathered so far.
+        timed_out: bool,
     }
 
     impl FakeHttp {
@@ -821,6 +1260,7 @@ mod tests {
                 live: vec!["xc-kv-b1-000".to_string()],
                 fail_search: false,
                 hits_by_target: HashMap::new(),
+                timed_out: false,
             }
         }
     }
@@ -849,7 +1289,11 @@ mod tests {
                 return Err("transport: connection refused".to_string());
             }
             let hits = self.hits_by_target.get(index).unwrap_or(&self.hits);
-            Ok(serde_json::json!({ "hits": { "hits": hits } }))
+            let mut response = serde_json::json!({ "hits": { "hits": hits } });
+            if self.timed_out {
+                response["timed_out"] = serde_json::json!(true);
+            }
+            Ok(response)
         }
     }
 
@@ -911,6 +1355,49 @@ mod tests {
         // No field-report nudge marker was ever part of this port (dropped
         // 2026-09-18): the prose must not ask the agent to report back.
         assert!(!out.text.to_lowercase().contains("report back"));
+        assert!(
+            out.warnings.iter().all(|w| !w.contains("timed_out")),
+            "a complete response must not be marked partial: {:?}",
+            out.warnings
+        );
+    }
+
+    /// The engine's 30s search deadline answers HTTP 200 with `timed_out:
+    /// true` and a prefix of the hits. `xerj code` used to print that prefix
+    /// as a finished ranking.
+    #[test]
+    fn a_search_deadline_marks_the_result_partial() {
+        let root = root_with_state();
+        let mut http = FakeHttp::new();
+        http.timed_out = true;
+        let out = run_code_query(
+            &root,
+            &http,
+            "u",
+            &CodeParams::new("kv", "addReplyNull"),
+            "`--stale-ok`",
+        );
+        assert_eq!(out.exit, 0, "partial hits are still a successful page");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("timed_out")),
+            "the deadline must be a warning, not a silent 200: {:?}",
+            out.warnings
+        );
+        assert!(
+            out.text.contains("valkey/src/networking.c"),
+            "the hits gathered before the deadline are still shown: {}",
+            out.text
+        );
+
+        let mut params = CodeParams::new("kv", "addReplyNull");
+        params.as_json = true;
+        let out = run_code_query(&root, &http, "u", &params, "`--stale-ok`");
+        assert_eq!(
+            out.json.as_ref().and_then(|v| v.get("timed_out")),
+            Some(&serde_json::json!(true)),
+            "json output keeps the ES timed_out flag: {:?}",
+            out.json
+        );
     }
 
     #[test]
@@ -1068,11 +1555,125 @@ mod tests {
             "{}",
             out.text
         );
+        // #1504: the mode line names the default embedder. It must not claim
+        // the running node is neural — only what the default is and the flag
+        // that changes it.
+        assert!(
+            out.text.contains("lexical feature-hashing")
+                && out.text.contains("--embed-mode neural"),
+            "vector mode line must name the default embedder: {}",
+            out.text
+        );
         assert!(
             out.text.contains("rrf 4.20"),
             "hybrid scores render as rrf: {}",
             out.text
         );
+    }
+
+    /// #1504: standalone semantic prints the same embedder default. BM25 does
+    /// not — there is no vector leg to misread.
+    #[test]
+    fn semantic_mode_names_the_default_embedder_and_bm25_does_not() {
+        let root = root_with_state();
+        let mut http = FakeHttp::new();
+        http.mapping = serde_json::json!({
+            "xc-kv-b1-000": { "mappings": { "properties": { "body": { "type": "semantic_text" } } } },
+            "xc-kv-b1-001": { "mappings": { "properties": { "body": { "type": "text" } } } }
+        });
+        http.live = vec!["xc-kv-b1-000".into(), "xc-kv-b1-001".into()];
+        let mut p = CodeParams::new("kv", "addReplyNull");
+        p.mode = Mode::Semantic;
+        let out = run_code_query(&root, &http, "u", &p, "`--stale-ok`");
+        assert_eq!(out.exit, 0, "{}", out.text);
+        assert!(
+            out.text.contains("vector only over 1 of 2")
+                && out.text.contains("lexical feature-hashing")
+                && out.text.contains("--embed-mode neural"),
+            "{}",
+            out.text
+        );
+
+        let bm25 = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "addReplyNull"),
+            "`--stale-ok`",
+        );
+        assert_eq!(bm25.exit, 0, "{}", bm25.text);
+        assert!(
+            !bm25.text.contains("--embed-mode neural"),
+            "bm25 has no vector leg: {}",
+            bm25.text
+        );
+    }
+
+    /// #1504: lang catalogs, Android strings, Apple .strings, gettext, and
+    /// minified bundles sort behind an implementing source file. A page that
+    /// is only catalogs keeps its order. A PHP service file is not a catalog
+    /// just because the repo also has `lang/`.
+    #[test]
+    fn catalog_and_minified_hits_rank_behind_source() {
+        let hit = |path: &str, score: f64| {
+            serde_json::json!({
+                "_index": "xc-aipbx-000",
+                "_score": score,
+                "_source": { "ax_path": path, "ax_file": path, "body": "phrase" }
+            })
+        };
+        let hits = vec![
+            hit("web/lang/en.php", 9.0),
+            hit("assets/jssip.min.js", 8.0),
+            hit("res/values-da/strings.xml", 7.0),
+            hit("ios/en.lproj/Localizable.strings", 6.0),
+            hit("locale/app.po", 5.5),
+            hit("locale/app.pot", 5.4),
+            hit("android/service/PbxForegroundService.kt", 4.0),
+            hit("web/src/services/phones/NecTemplate.php", 3.0),
+            hit("docs/phones.md", 2.0),
+        ];
+        let demoted = demote_catalog_noise(hits);
+        let paths: Vec<&str> = demoted
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            &paths[..3],
+            [
+                "android/service/PbxForegroundService.kt",
+                "web/src/services/phones/NecTemplate.php",
+                "docs/phones.md",
+            ]
+        );
+        assert!(paths[3..].iter().all(|p| is_catalog_noise(p)), "{paths:?}");
+
+        let (page, _, _) = diversify(demoted, 3);
+        let page_paths: Vec<&str> = page
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            page_paths,
+            [
+                "android/service/PbxForegroundService.kt",
+                "web/src/services/phones/NecTemplate.php",
+                "docs/phones.md",
+            ]
+        );
+
+        let only = demote_catalog_noise(vec![
+            hit("web/lang/hr.php", 9.0),
+            hit("web/lang/en.php", 8.0),
+        ]);
+        assert_eq!(only[0]["_source"]["ax_path"], "web/lang/hr.php");
+        assert_eq!(only[1]["_source"]["ax_path"], "web/lang/en.php");
+
+        assert!(!is_catalog_noise("src/main.rs"));
+        assert!(!is_catalog_noise("res/layout/activity.xml"));
+        assert!(is_catalog_noise("web/lang/en.php"));
+        assert!(is_catalog_noise("res/values/strings.xml"));
+        assert!(is_catalog_noise("assets/app.min.css"));
     }
 
     /// #1146: with a mixed mapping the fused request may only go to the
@@ -1208,7 +1809,16 @@ mod tests {
     /// vector@10 (the #1137 overfetch widened the BM25 leg alone).
     #[test]
     fn the_vector_leg_carries_the_fetch_window_as_k() {
-        let sem = semantic_body("q", 50, &None);
+        let sem = semantic_on_field("body", "q", 50, &None);
+        assert_eq!(
+            sem.pointer("/query/semantic/field"),
+            Some(&serde_json::json!("body"))
+        );
+        let on_code = semantic_on_field("code", "q", 50, &None);
+        assert_eq!(
+            on_code.pointer("/query/semantic/field"),
+            Some(&serde_json::json!("code"))
+        );
         assert_eq!(sem.pointer("/size"), Some(&serde_json::json!(50)));
         assert_eq!(
             sem.pointer("/query/semantic/k"),
@@ -1234,7 +1844,7 @@ mod tests {
         let lang = Some("rust".to_string());
         let want_filter = serde_json::json!([{ "match": { "language": "rust" } }]);
 
-        let sem = semantic_body("q", 50, &lang);
+        let sem = semantic_on_field("body", "q", 50, &lang);
         let must = sem.pointer("/query/bool/must").and_then(Value::as_array);
         assert_eq!(must.map(Vec::len), Some(1), "{sem}");
         assert!(must.unwrap()[0].get("semantic").is_some(), "{sem}");
@@ -1499,5 +2109,93 @@ mod tests {
             })
             .collect();
         assert_eq!(files, vec!["file1", "fileX"], "fileX's slot was not burned");
+    }
+
+    #[test]
+    fn fuse_file_and_symbol_hits_rolls_up_per_file_and_stamps_winning_symbol_span() {
+        struct NoopHttp;
+        impl XcHttp for NoopHttp {
+            fn get_mapping(&self, _: &str) -> Result<Value, String> {
+                Err("unused".into())
+            }
+            fn cat_indices_json(&self, _: &str) -> Result<Vec<String>, String> {
+                Ok(vec![])
+            }
+            fn search(&self, _: &str, _: &Value) -> Result<Value, String> {
+                Ok(serde_json::json!({ "hits": { "hits": [] } }))
+            }
+        }
+
+        // File leg ranks monolith.rs #1 and Target.rs #2; symbol leg ranks two
+        // functions in Target.rs at #1 and #2 (must roll up to ONE vote at
+        // rank 1, not two votes) and monolith.rs absent from symbol leg.
+        // RRF(k=60):
+        //   Target.rs   = 1/(60+2) + 1/(60+1) = 1/62 + 1/61 = 0.032522...
+        //   monolith.rs = 1/(60+1) + 0        = 1/61        = 0.016393...
+        let file_hits = vec![
+            serde_json::json!({
+                "_index": "xc-test-000",
+                "_score": 12.0,
+                "_source": {
+                    "ax_path": "src/monolith.rs",
+                    "ax_file": "src/monolith.rs",
+                    "body": "fn big() {}\n",
+                    "symbols": [{ "name": "big", "kind": "function", "line": 1 }]
+                }
+            }),
+            serde_json::json!({
+                "_index": "xc-test-000",
+                "_score": 9.0,
+                "_source": {
+                    "ax_path": "src/target.rs",
+                    "ax_file": "src/target.rs",
+                    "body": "fn helper() {\n    let x = 1;\n}\n",
+                    "symbols": [{ "name": "helper", "kind": "function", "line": 1 }]
+                }
+            }),
+        ];
+        let sym_hits = vec![
+            serde_json::json!({
+                "_index": "xc-test-000",
+                "_score": 18.0,
+                "_source": {
+                    "ax_path": "src/target.rs",
+                    "ax_file": "src/target.rs",
+                    "name": "helper",
+                    "kind": "function",
+                    "line": 1,
+                    "end_line": 3
+                }
+            }),
+            serde_json::json!({
+                "_index": "xc-test-000",
+                "_score": 17.0,
+                "_source": {
+                    "ax_path": "src/target.rs",
+                    "ax_file": "src/target.rs",
+                    "name": "second_fn",
+                    "kind": "function",
+                    "line": 10,
+                    "end_line": 15
+                }
+            }),
+        ];
+        let fused =
+            fuse_file_and_symbol_hits(&NoopHttp, "xc-test*", file_hits, sym_hits, 5, &mut false);
+        assert_eq!(fused.len(), 2);
+        assert_eq!(
+            fused[0].pointer("/_source/ax_path").and_then(Value::as_str),
+            Some("src/target.rs")
+        );
+        let expected_rrf = 1.0 / 62.0 + 1.0 / 61.0;
+        let got_score = fused[0].get("_score").and_then(Value::as_f64).unwrap();
+        assert!((got_score - expected_rrf).abs() < 1e-12);
+        assert_eq!(
+            fused[0]
+                .pointer("/_source/symbols/0/end_line")
+                .and_then(Value::as_i64),
+            Some(3),
+            "winning symbol end_line stamped onto file record's symbols entry"
+        );
     }
 }

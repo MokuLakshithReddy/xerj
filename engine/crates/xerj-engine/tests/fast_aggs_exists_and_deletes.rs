@@ -20,7 +20,7 @@
 use serde_json::json;
 use tempfile::TempDir;
 use xerj_common::config::Config;
-use xerj_common::types::Schema;
+use xerj_common::types::{FieldConfig, FieldType, Schema};
 use xerj_engine::aggs::fast_path_aggs_served;
 use xerj_engine::{Engine, Index};
 use xerj_query::parse_request;
@@ -39,6 +39,29 @@ fn make_engine(dir: &TempDir) -> Engine {
     let mut config = Config::default();
     config.server.data_dir = dir.path().to_str().unwrap().to_string();
     Engine::new(config).expect("engine::new")
+}
+
+/// A schema that DECLARES the given string fields as `keyword`, mirroring the
+/// real autoindex catalog mapping (`catalog.rs::catalog_mapping` declares
+/// `format`/`path`/`status`/`file_key` as keyword).
+///
+/// These tests stand in for that catalog but used `Schema::empty()`, letting
+/// their string fields (`extension`, `text`, `group`) be dynamically mapped.
+/// Since #1329 a dynamically mapped string is a `text` parent with NO
+/// doc-values (only its `.keyword` sub-field carries them, matching ES), and a
+/// `text` field never gets a doc-values column regardless of the flag
+/// (`FieldConfig::stored_doc_values` excludes `Text`). The columnar fast path
+/// — the terms executor and the `KwExists` arm alike — reads that doc-values
+/// column, so an inferred stand-in makes every "must serve columnarly"
+/// assertion bail to brute. Declaring the stand-ins keyword restores the
+/// column the catalog's real keyword fields have. Numeric fields (`v`, `i`)
+/// are unaffected and stay inferred.
+fn kw_schema(fields: &[&str]) -> Schema {
+    let mut s = Schema::empty();
+    for f in fields {
+        s.fields.push(FieldConfig::new(*f, FieldType::Keyword));
+    }
+    s
 }
 
 async fn run(idx: &std::sync::Arc<Index>, body: serde_json::Value) -> serde_json::Value {
@@ -94,7 +117,9 @@ async fn exists_in_top_filter_matches_brute() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("existsq", Schema::empty()).unwrap();
+    engine
+        .create_index("existsq", kw_schema(&["extension", "text"]))
+        .unwrap();
     let idx = engine.get_index("existsq").unwrap();
     seed_exists_shapes(&idx).await;
 
@@ -137,7 +162,9 @@ async fn exists_on_numeric_field_matches_brute() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("existsn", Schema::empty()).unwrap();
+    engine
+        .create_index("existsn", kw_schema(&["group"]))
+        .unwrap();
     let idx = engine.get_index("existsn").unwrap();
     for i in 0..12_000u32 {
         let mut doc = json!({ "group": if i % 2 == 0 { "a" } else { "b" } });
@@ -213,7 +240,9 @@ async fn unmerged_ghosts_still_bail() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("ghosts", Schema::empty()).unwrap();
+    engine
+        .create_index("ghosts", kw_schema(&["group"]))
+        .unwrap();
     let idx = engine.get_index("ghosts").unwrap();
     for i in 0..12_000u32 {
         idx.index_document(
@@ -265,7 +294,9 @@ async fn merged_delete_history_re_qualifies_for_fast_path() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("readmit", Schema::empty()).unwrap();
+    engine
+        .create_index("readmit", kw_schema(&["extension"]))
+        .unwrap();
     let idx = engine.get_index("readmit").unwrap();
     for i in 0..12_000u32 {
         idx.index_document(
@@ -303,8 +334,21 @@ async fn merged_delete_history_re_qualifies_for_fast_path() {
     let q = json!({
         "query": {
             "bool": {
+                // A one-element `terms` SET, not a singular `term`: on a
+                // declared keyword field a singular `term` is deliberately
+                // kept in the FTS scoring tree (index.rs
+                // `query_node_to_fts_projected`, so a mixed bool can add its
+                // BM25 score), which makes `query_needs_fts` true and routes a
+                // size:0 agg to the brute path — never the columnar fast path
+                // this test asserts. The real finalize-verify window
+                // (`sync_executor::windowed_value_counts`) filters with a
+                // `terms` set over a digest window, so `terms` is also the
+                // production-faithful shape. A one-element set matches exactly
+                // the same docs as `term`. (Before #1329 `extension` was an
+                // inferred `text` field, classified differently, so the
+                // singular `term` happened to take the fast path.)
                 "filter": [
-                    { "term": { "extension": "css" } },
+                    { "terms": { "extension": ["css"] } },
                     { "exists": { "field": "i" } }
                 ]
             }
@@ -349,7 +393,9 @@ async fn object_valued_memtable_doc_counts_as_exists() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("objmem", Schema::empty()).unwrap();
+    engine
+        .create_index("objmem", kw_schema(&["extension", "text"]))
+        .unwrap();
     let idx = engine.get_index("objmem").unwrap();
     for i in 0..12_000u32 {
         idx.index_document(

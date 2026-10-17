@@ -636,8 +636,15 @@ fn ensure_compatible(fields: &HashMap<String, FieldAcc>, dataset: &PlanDataset) 
             // (#580), because `symbols` is observed on every generation but was
             // pruned from the frozen schema. A field that DOES carry scalar
             // values yet is absent is still a real incompatibility.
+            //
+            // #1237: `impl` and `end_line` on symbol records were added after
+            // #579 froze the five symbol scalar fields; tolerate their absence
+            // on pre-#1237 frozen `docs`/`code` datasets so incremental runs
+            // over existing state dirs do not abort.
+            let pre_1237_symbol_field = (name == "impl" || name == "end_line")
+                && (dataset.family == "docs" || dataset.family == "code");
             anyhow::ensure!(
-                acc.n == 0,
+                acc.n == 0 || pre_1237_symbol_field,
                 "field {name} is absent from frozen dataset {}",
                 dataset.slug
             );

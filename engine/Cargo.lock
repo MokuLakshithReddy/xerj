@@ -153,15 +153,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -965,18 +956,20 @@ dependencies = [
 
 [[package]]
 name = "calamine"
-version = "0.26.1"
+version = "0.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "138646b9af2c5d7f1804ea4bf93afc597737d2bd4f7341d67c48b03316976eb1"
+checksum = "5fa68281b1a76b54a62156474adb06bb380a67e07dd60656e3217152b42183f3"
 dependencies = [
+ "atoi_simd",
  "byteorder",
  "chrono",
  "codepage",
  "encoding_rs",
+ "fast-float2",
  "log",
- "quick-xml 0.31.0",
+ "quick-xml",
  "serde",
- "zip 2.4.2",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -1098,9 +1091,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -1673,17 +1666,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1971,6 +1953,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -3711,7 +3703,7 @@ dependencies = [
  "fast-float2",
  "libc",
  "log",
- "quick-xml 0.41.0",
+ "quick-xml",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3917,7 +3909,7 @@ dependencies = [
  "nom 8.0.0",
  "office_oxide",
  "phf 0.14.0",
- "quick-xml 0.41.0",
+ "quick-xml",
  "regex",
  "serde",
  "serde_json",
@@ -4456,20 +4448,11 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quick-xml"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1004a344b30a54e2ee58d66a71b32d2db2feb0a31f9a2d302bf0536f15de2a33"
-dependencies = [
- "encoding_rs",
- "memchr",
-]
-
-[[package]]
-name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
+ "encoding_rs",
  "memchr",
  "serde",
 ]
@@ -4935,9 +4918,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -5512,6 +5495,17 @@ dependencies = [
  "grid",
  "serde",
  "slotmap",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
 ]
 
 [[package]]
@@ -7301,8 +7295,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "xerj-ai"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -7325,7 +7329,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-api"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7350,8 +7354,10 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "xerj-ai",
+ "xerj-autoindex",
  "xerj-common",
  "xerj-engine",
+ "xerj-hub",
  "xerj-query",
  "xerj-rerank",
  "xerj-wasm",
@@ -7360,7 +7366,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-autoindex"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "aws-sdk-s3",
@@ -7380,7 +7386,7 @@ dependencies = [
  "memchr",
  "notify",
  "pdf_oxide",
- "quick-xml 0.41.0",
+ "quick-xml",
  "rayon",
  "regex",
  "reqwest",
@@ -7434,12 +7440,12 @@ dependencies = [
  "walkdir",
  "xerj-common",
  "xxhash-rust",
- "zip 2.4.2",
+ "zip 8.6.0",
 ]
 
 [[package]]
 name = "xerj-cluster"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7464,7 +7470,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-common"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -7484,7 +7490,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-compress"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "byteorder",
  "bytes",
@@ -7497,7 +7503,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-console-api"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7533,7 +7539,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-engine"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7588,7 +7594,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-fts"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "bitpacking",
@@ -7614,8 +7620,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "xerj-hub"
+version = "1.0.0-rc.96"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml",
+ "xerj-api",
+ "xerj-autoindex",
+ "xerj-common",
+ "xerj-engine",
+ "zstd",
+]
+
+[[package]]
 name = "xerj-logs"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -7633,21 +7663,25 @@ dependencies = [
 
 [[package]]
 name = "xerj-mcp"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
+ "axum",
  "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
  "unicode-segmentation",
+ "xerj-api",
  "xerj-common",
+ "xerj-engine",
+ "xerj-hub",
  "xerj-rerank",
 ]
 
 [[package]]
 name = "xerj-query"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7662,7 +7696,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-rerank"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "reqwest",
  "serde",
@@ -7676,7 +7710,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-server"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "axum",
@@ -7705,6 +7739,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
  "xerj-ai",
@@ -7716,6 +7751,7 @@ dependencies = [
  "xerj-console-api",
  "xerj-engine",
  "xerj-fts",
+ "xerj-hub",
  "xerj-logs",
  "xerj-mcp",
  "xerj-query",
@@ -7725,7 +7761,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-storage"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7758,7 +7794,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-vector"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -7776,7 +7812,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-wasm"
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.96"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7913,23 +7949,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "zip"
-version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
-dependencies = [
- "arbitrary",
- "crc32fast",
- "crossbeam-utils",
- "displaydoc",
- "flate2",
- "indexmap 2.14.0",
- "memchr",
- "thiserror 2.0.18",
- "zopfli",
 ]
 
 [[package]]

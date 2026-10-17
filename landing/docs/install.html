@@ -291,7 +291,7 @@ data_dir     = "/var/lib/xerj"
 
 [auth]
 enabled = true</pre>
-  <p>With <code class="inline">auth.enabled = true</code>, the first start prints an auto-generated admin API key and writes it to <code class="inline">&lt;data_dir&gt;/admin.key</code> — every native-API request (including health) must send it, and so must the CLI clients that talk to this node (see <a href="#first-index">Index your first folder</a> below). In-process TLS is not wired yet (rustls integration is on the roadmap) — terminate TLS at a reverse proxy (nginx/caddy) in front of ports 8080/9200 for now.</p>
+  <p>With <code class="inline">auth.enabled = true</code>, the first start prints an auto-generated admin API key and writes it to <code class="inline">&lt;data_dir&gt;/admin.key</code> — every native-API request (including health) must send it, and so must the CLI clients that talk to this node (see <a href="#first-index">Index your first folder</a> below). For TLS, either set <code class="inline">[tls] enabled = true</code> with a PEM <code class="inline">cert_path</code> and <code class="inline">key_path</code> (in-process rustls on ports 8080/9200; see <a href="/docs/security">Auth &amp; TLS</a>), or terminate TLS at a reverse proxy (nginx/caddy) in front of those ports. The gRPC port 8081 stays plaintext h2c either way.</p>
 
   <h2>Run as a systemd unit</h2>
   <p>Create the service user first — <code class="inline">StateDirectory</code> then gives it <code class="inline">/var/lib/xerj</code> automatically:</p>
@@ -345,7 +345,7 @@ $ docker run -d --name xerj \
 
   <!-- Print-only branded footer (hidden on screen, visible in PDF) -->
   <div class="print-footer" style="display:none;">
-    <span>XERJ.AI · V1.0.0-RC.95 · 2026-08-11</span>
+    <span>XERJ.AI · V1.0.0-RC.96 · 2026-08-11</span>
     <a href="https://xerj.org/docs/">https://xerj.org/docs/</a>
     <span>Install</span>
   </div>
@@ -403,7 +403,7 @@ $ docker run -d --name xerj \
 </nav>
 <!-- seo:footer-end -->
 <footer class="footer">
-  <span>XERJ.AI · DOCS · V1.0.0-RC.95</span>
+  <span>XERJ.AI · DOCS · V1.0.0-RC.96</span>
   <span>READ THE SOURCE</span>
   <span><a href="/">HOME</a> · <a href="/product">PRODUCT</a> · <a href="/brand">BRAND</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>

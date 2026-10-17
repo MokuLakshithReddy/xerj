@@ -275,22 +275,20 @@ $ ssh node-&lt;id&gt; sudo systemctl start xerj
 
   <p>Because index data is node-local today, each node's data directory is also each node's upgrade responsibility — snapshot per the <a href="/docs/backup-restore">backup guide</a> before touching the binary.</p>
 
-  <h2>On-disk format migrations</h2>
-  <p>A major release that changes the segment format ships a <code class="inline">migrate</code> subcommand. Run it after stopping the old binary and before starting the new one:</p>
-<pre class="code">$ sudo systemctl stop xerj
-$ xerj migrate --from 1.x --to 2.x --data-dir /var/lib/xerj
-Scanning segments... 842 found
-Rewriting segment 1/842: logs/seg-000123 ... ok
-...
-Migration complete. Verify with: xerj verify --data-dir /var/lib/xerj
-$ sudo systemctl start xerj</pre>
-
-  <p>The migrator is idempotent — if it crashes halfway, re-run it. It never touches source segments until the replacement is fully written and fsynced.</p>
+  <h2>On-disk format</h2>
+  <p>There is no migration step and no <code class="inline">migrate</code> subcommand: a newer binary opens an older data directory in place. What guards the layout is a format marker that every index directory carries, <code class="inline">&lt;data_dir&gt;/&lt;index&gt;/xerj_meta.json</code>:</p>
+<pre class="code">$ sudo cat /var/lib/xerj/logs/xerj_meta.json
+{"format_version":1,"xerj_version":"1.0.0-rc.95"}</pre>
+  <p>A binary checks the marker before it opens anything else in that index. If <code class="inline">format_version</code> is higher than it understands, it does not open the index, so it cannot misread or garbage-collect segments it does not recognise. The node still starts; the index is logged as failed to open, with this reason:</p>
+<pre class="code">data dir /var/lib/xerj/logs was written by a newer xerj (data-dir format version 2);
+this binary supports up to 1. Refusing to open — upgrade xerj to a build that
+understands format 2.</pre>
+  <p>Current binaries read format 2. Opening an index never raises its marker. It moves from 1 to 2 only when a flush writes a full-text field whose name cannot be used literally in a file name: longer than 128 bytes, or containing a character such as <code class="inline">/ \ : * ? " &lt; &gt; |</code>.</p>
 
   <h2>Rolling back</h2>
-  <p>Patch releases roll back by reinstalling the previous binary. Across a format migration, rolling back requires the pre-migration backup — there is no inverse migrator.</p>
+  <p>Roll back by reinstalling the previous binary. That works for every index whose marker is still at a version the previous binary reads; check the <code class="inline">xerj_meta.json</code> files first. An index whose marker has moved past it will not open under the old binary, and rolling it back means restoring the backup you took before the upgrade.</p>
 
-  <p class="source-note">Source · engine/crates/xerj-server/src/main.rs</p>
+  <p class="source-note">Source · engine/crates/xerj-server/src/main.rs · engine/crates/xerj-storage/src/index_store.rs (check_data_dir_version) · engine/crates/xerj-fts/src/index.rs (field_file_component)</p>
   
 
 <div class="next">
@@ -300,7 +298,7 @@ $ sudo systemctl start xerj</pre>
 
   <!-- Print-only branded footer (hidden on screen, visible in PDF) -->
   <div class="print-footer" style="display:none;">
-    <span>XERJ.AI · V1.0.0-RC.95 · 2026-08-11</span>
+    <span>XERJ.AI · V1.0.0-RC.96 · 2026-08-11</span>
     <a href="https://xerj.org/docs/">https://xerj.org/docs/</a>
     <span>Upgrades</span>
   </div>
@@ -358,7 +356,7 @@ $ sudo systemctl start xerj</pre>
 </nav>
 <!-- seo:footer-end -->
 <footer class="footer">
-  <span>XERJ.AI · DOCS · V1.0.0-RC.95</span>
+  <span>XERJ.AI · DOCS · V1.0.0-RC.96</span>
   <span>READ THE SOURCE</span>
   <span><a href="/">HOME</a> · <a href="/product">PRODUCT</a> · <a href="/brand">BRAND</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>

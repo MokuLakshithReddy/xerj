@@ -2,9 +2,32 @@
 
 This roadmap tracks capabilities that are **planned but not yet fully implemented**, so the project's public claims stay honest about what ships today versus what is coming. Status is verified against the actual code and by real API requests to the release binary, not aspirational.
 
-Last reviewed: 2026-10-12 (against `v1.0.0-rc.95` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298 — closed as abandoned 2026-09-29; the machine check, not the issue, enforces the cadence now). This pass is the rc.95 release-cut roll:
+Last reviewed: 2026-10-15 (against `v1.0.0-rc.96` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298 — closed as abandoned 2026-09-29; the machine check, not the issue, enforces the cadence now). This pass is the rc.96 release-cut roll:
 the open-defects shortlist was re-verified against the live tracker at
-cut time — **nine open** (unchanged from rc.94): #1094, #1108, #1110,
+cut time — **five open**: #1094, #1110, #1122, #1170, #1267. Four
+closed inside the window: #1250 (multi-index ingest against the breaker:
+the live-tunable watermark, PR
+[#1323](https://github.com/xerj-org/xerj/pull/1323), and the damped bulk
+AIMD client, PR [#1482](https://github.com/xerj-org/xerj/pull/1482)), #1108 (the #1062 wrong-and-confident gate run
+through the real `_watcher` path and published as a FAIL, PR
+[#1322](https://github.com/xerj-org/xerj/pull/1322)), #1183 (the
+dishonest-resume footer, PR
+[#1318](https://github.com/xerj-org/xerj/pull/1318)) and #1226 (empty
+shards skip the shared finalize gate, PRs
+[#1319](https://github.com/xerj-org/xerj/pull/1319) and
+[#1456](https://github.com/xerj-org/xerj/pull/1456)). The window since
+rc.95 was a fix-and-honesty sweep of 60-odd merged PRs — total tie order
+on two more `term` routes (#1359), the ES dynamic-mapping doc-values
+default for inferred `text` (#1329), the memory-breaker work that closed
+#1250, finalize progress and old-server detection
+(partial #1267), native Windows home resolution, `xerj init` backup and
+upgrade safety, and the `quinn-proto` / `calamine` security updates; the
+CHANGELOG lists every PR. Corpus Hub v2 code merged (PR
+[#1423](https://github.com/xerj-org/xerj/pull/1423)) but is not a
+feature of rc.96: no hub signing key is compiled in, so no pack can be
+verified and none is downloaded.
+The rc.95 cut's record stands as written: the open-defects shortlist
+was re-verified at that cut — **nine open** (unchanged from rc.94): #1094, #1108, #1110,
 #1122, #1170, #1183, #1226, #1250, #1267. The window since rc.94 landed
 legacy Microsoft Office support in `xerj autoindex` — `.xls` (BIFF via
 calamine) and `.doc` (Word 97+ text via the FIB piece table), with OLE2
@@ -289,18 +312,13 @@ empty. The plan tracker
 [#1065](https://github.com/xerj-org/xerj/issues/1065) is complete and closed.
 
 **What rides it:** the open defects below (the gate-run findings
-and the console review's), the #1062 wrong-and-confident detection gate, the
+and the console review's), the
 `/_ask` token arm (designed, live-model cost not approved), the
 `xerj-decide-v1` Hugging Face publication (operator credentials), and the GA
 bar itself — *The road to v1.0.0 GA* below.
 
-**Open defects.** Eight, all live on the tracker — the
+**Open defects.** Five, all live on the tracker — the
 shortlist the release-notes gate checks. From the rc.92 window:
-[#1250](https://github.com/xerj-org/xerj/issues/1250) (multi-index
-ingest oscillates on the parent RSS breaker; root cause re-attributed
-same-day to the boot-time tiered process cap, mitigation the
-`XERJ_MAX_PROCESS_MEMORY_MB` restart, and the same cap drives an idle
-flush loop measured at 644/858 GB of writes) and
 [#1267](https://github.com/xerj-org/xerj/issues/1267) (the finalize
 slow-query residual after #1260: the catalog_generation read-back walk
 brute-pages `term run_id` + `_id` sort at ~5.2 s per 1,000-doc page —
@@ -319,22 +337,22 @@ panic line). From the cluster-mode testing:
 [#1170](https://github.com/xerj-org/xerj/issues/1170) (the Raft ring is
 never connected to the engine). Filed from the corpus-program work:
 [#1110](https://github.com/xerj-org/xerj/issues/1110) (the
-generalization proof: second-domain pack + fresh-machine replay) and
-[#1183](https://github.com/xerj-org/xerj/issues/1183) (corpus index
-finalize-catalog reported as an all-thread deadlock: diagnosed as a bounded
-but silent client retry envelope — the silence is fixed, and the rc.88
-read-back fix (PR
-[#1207](https://github.com/xerj-org/xerj/pull/1207)) removed the agg that
-made finalize estimate 1.1 GB against the 512 MB query-memory breaker; the
-issue stays open until a full xerj-search rebuild passes finalize-catalog
-end-to-end with the fixed client, and the #1122 memory-ceiling class stays
-its companion). From the rc.90 window,
-[#1226](https://github.com/xerj-org/xerj/issues/1226) (`_refresh` /
-`delete_by_query?refresh=true` costs 5–16 s under concurrent bulk write
-load — mostly reframed by #1227: those latencies were the unconditional
-no-match flush that #1225 and #1227 removed the callers of; what stays
-open is the flush itself under concurrent bulk load, measured 14–16 s on
-the corpus-builder node).
+generalization proof: second-domain pack + fresh-machine replay).
+**Closed inside the rc.96 window and recorded in the CHANGELOG, not
+carried here:** #1250 (multi-index ingest oscillating on the parent
+RSS breaker: the watermark is live-tunable, PR
+[#1323](https://github.com/xerj-org/xerj/pull/1323), and the bulk client's
+AIMD is damped, PR [#1482](https://github.com/xerj-org/xerj/pull/1482)),
+#1108 (the #1062 wrong-and-confident detection gate,
+run through the real `_watcher` path and published as a FAIL — 0.2449 at
+raw `p` ≥ 0.8 against the ≤ 0.05 bar, PR
+[#1322](https://github.com/xerj-org/xerj/pull/1322)), #1183 (an aborted
+resume no longer prints the "searchable" footer, PR
+[#1318](https://github.com/xerj-org/xerj/pull/1318); the #1122
+memory-ceiling class it named as its companion stays open) and #1226
+(empty shards no longer queue behind the shared finalize gate, PRs
+[#1319](https://github.com/xerj-org/xerj/pull/1319) and
+[#1456](https://github.com/xerj-org/xerj/pull/1456)).
 **Closed inside the rc.94 window and recorded in the CHANGELOG, not
 carried here:** #1100 (second-brain vocabulary gated by corpus format, PR
 [#1310](https://github.com/xerj-org/xerj/pull/1310)), #1230 (sibling-fork

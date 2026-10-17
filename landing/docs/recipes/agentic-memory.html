@@ -373,6 +373,18 @@ All assertions passed.</pre>
     <li><strong><code class="inline">GET /_memory/{ns}</code></strong> lists up to 100 most-recent entries for debugging/audit; it is bounded and recent-first, not a full export.</li>
     <li><strong>Wire-compatible.</strong> Because a namespace is a real index, you can inspect or operate on it with the standard ES-compatible surface if you ever need to — the memory API is a thin, honest adapter over the same machinery.</li>
   </ul>
+
+  <h3>Before you trust a recall number</h3>
+  <p>The recall@1 and recall@3 above come from six hand-labelled probes. That is a smoke test. Before you use a recall number to choose an embedder, a chunking scheme or a recall path for your own agent, apply these field lessons. They were contributed by Chunxiao Wang (Assay / <a href="https://github.com/chunxiaoxx/nautilus-compass">nautilus-compass</a>) in <a href="https://github.com/xerj-org/xerj/issues/1138">#1138</a>, from a production agent-memory system, and are written up with their measurements in <a href="/blog/eval-scars-from-agent-memory">Six eval scars from a production agent-memory system</a>.</p>
+  <ul>
+    <li><strong>Probe with situations, not questions.</strong> An agent recalls from memory using its current state (<em>"deploy failed again with 401"</em>), not an information need (<em>"how do 401s work?"</em>). This recipe's probes are questions. Add probes taken from your own agent's transcripts.</li>
+    <li><strong>Score on your own memories.</strong> In their runs, slicing memories by topic instead of by token window moved recall@1 by double digits, a bigger effect than moving from dense-only to hybrid retrieval. Their own data also ranked two embedding models in the opposite order to their MTEB scores. Freeze a sample of your own memories and probes, and compare candidates on that sample.</li>
+    <li><strong>If every probe scores zero, check the harness first.</strong> A masking bug that drops the gold item from the candidate pool turns an eval into a constant zero, or a constant pass. In this recipe, the equivalent check is that each probe's expected id was stored in the namespace you recall from.</li>
+    <li><strong>Small n needs a baseline and an interval.</strong> With six probes, 5/6 against 6/6 is a single probe. Report counts next to percentages. Compute what a trivial strategy scores, for example <code class="inline">recency_weight: 1.0</code> (always the newest memory). Below about 100 probes, give a confidence interval.</li>
+    <li><strong>Compare recall paths on the same probes.</strong> kNN against BM25 on one probe set is a paired comparison. Count the probes where the two disagree (McNemar) instead of comparing two percentages.</li>
+    <li><strong>Freeze the criteria before the run.</strong> Write down the metric, the threshold and the artifact that will prove each claim before you run anything. Criteria may tighten mid-run but must not loosen.</li>
+  </ul>
+  <p>The same team donated a corpus of real multi-session agent trajectories, with the failure turns kept, to the corpus hub as <a href="https://github.com/xerj-org/xerj/releases/tag/pack-agent-session-trajectories-2026-10-09"><code class="inline">agent-session-trajectories</code></a>. It is a starting point for testing recall on agent history instead of reference docs.</p>
 </main>
 </div>
 
@@ -427,7 +439,7 @@ All assertions passed.</pre>
 </nav>
 <!-- seo:footer-end -->
 <footer class="footer">
-  <span>XERJ.AI · DOCS · V1.0.0-RC.95</span>
+  <span>XERJ.AI · DOCS · V1.0.0-RC.96</span>
   <span>READ THE SOURCE</span>
   <span><a href="/">HOME</a> · <a href="/product">PRODUCT</a> · <a href="/brand">BRAND</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>

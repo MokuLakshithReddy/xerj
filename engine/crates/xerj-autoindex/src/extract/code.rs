@@ -1090,6 +1090,132 @@ fn cpp_declarator_is_const_qualified(node: tree_sitter::Node, source: &[u8]) -> 
     false
 }
 
+/// The literal value of a constant / macro / field declaration, or `None` for
+/// anything else (a function, a type, a declaration with no initialiser).
+///
+/// Applied to a definition's declaration text (the `code` slice of a [`Symbol`],
+/// which is `DefRecord.text`). The per-language rules are fixed by
+/// `docs/CORPUS_HUB_V2_IMPLEMENTATION.md` step 3. The captured value is trimmed
+/// and loses a trailing `;` or `,`.
+pub fn extract_value(lang: &str, decl: &str) -> Option<String> {
+    fn clean(s: &str) -> Option<String> {
+        let v = s.trim().trim_end_matches([';', ',']).trim();
+        (!v.is_empty()).then(|| v.to_string())
+    }
+    // Quote-aware value end: when the matched value opens with `"`, take through
+    // its matching close quote so a `;` or `//` INSIDE the string is not read as
+    // a terminator. The lazy value regexes below otherwise stop at the first
+    // `;`/`//` and tear `"a;b"` down to `"a`, `"http://x"` down to `"http:`. The
+    // regex still locates where the value STARTS (`m.start()`); only its end is
+    // recomputed here. Every non-string value falls through to `clean`, byte for
+    // byte as before. NOTE: a backslash-escaped quote inside the string
+    // (`"a\"b"`) is a known limitation — the scan stops at the first `"`; such
+    // values are rare enough in a constant that handling escapes is not worth
+    // the extra code.
+    fn value_of(decl: &str, m: Option<regex::Match<'_>>) -> Option<String> {
+        let m = m?;
+        let rest = &decl[m.start()..];
+        if let Some(body) = rest.strip_prefix('"') {
+            if let Some(rel) = body.find('"') {
+                // opening quote + body + closing quote (quote is 1 ASCII byte)
+                return Some(rest[..rel + 2].to_string());
+            }
+        }
+        clean(m.as_str())
+    }
+    use std::sync::OnceLock;
+    static C_DEFINE: OnceLock<regex::Regex> = OnceLock::new();
+    static C_CONST: OnceLock<regex::Regex> = OnceLock::new();
+    static RUST: OnceLock<regex::Regex> = OnceLock::new();
+    static GO: OnceLock<regex::Regex> = OnceLock::new();
+    static UPPER: OnceLock<regex::Regex> = OnceLock::new();
+    match lang {
+        "c" | "cpp" | "objc" => {
+            let def = C_DEFINE.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*#\s*define\s+(\w+)\s+(.+?)\s*(?:/[/*].*)?$").unwrap()
+            });
+            if let Some(c) = def.captures(decl) {
+                if let Some(v) = value_of(decl, c.get(2)) {
+                    return Some(v);
+                }
+            }
+            let cst = C_CONST.get_or_init(|| {
+                regex::Regex::new(r"\b(?:static\s+)?const\s+\w[\w\s\*]*\b(\w+)\s*=\s*(.+?)\s*;")
+                    .unwrap()
+            });
+            cst.captures(decl).and_then(|c| value_of(decl, c.get(2)))
+        }
+        "rust" => {
+            let re = RUST.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(\w+)\s*:\s*[^=]+=\s*(.+?)\s*;")
+                    .unwrap()
+            });
+            re.captures(decl).and_then(|c| value_of(decl, c.get(2)))
+        }
+        "go" => {
+            let re = GO.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*(?:const\s+)?(\w+)\s*(?:[\w.\[\]*]+\s+)?=\s*(.+?)\s*$")
+                    .unwrap()
+            });
+            re.captures(decl).and_then(|c| value_of(decl, c.get(2)))
+        }
+        "python" | "ruby" | "bash" | "sh" | "shell" => {
+            let re = UPPER.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+?)\s*$").unwrap()
+            });
+            re.captures(decl).and_then(|c| value_of(decl, c.get(2)))
+        }
+        _ => None,
+    }
+}
+
+/// Every definition in one file, as [`DefRecord`]s for the hub pack's defs index.
+///
+/// `file_rel` is the path relative to the corpus root (forward slashes), `lang`
+/// is a registry language name (`registry()`), `text` is the file's decoded
+/// contents. Unknown languages yield no records. The declaration text is capped
+/// at 400 chars; constants and macros carry their value ([`extract_value`]).
+pub fn definitions(file_rel: &str, lang: &str, text: &str) -> Vec<xerj_common::hub::DefRecord> {
+    let Some(def) = registry().iter().find(|d| d.name == lang) else {
+        return Vec::new();
+    };
+    parse_symbols(def, text)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let decl: String = if s.code.chars().count() > 400 {
+                s.code.chars().take(400).collect()
+            } else {
+                s.code
+            };
+            // Only a named constant (`const`) carries a literal value. The
+            // per-language `extract_value` is a regex with no notion of symbol
+            // kind, so run on EVERY symbol it reads a function prototype's
+            // default argument (`void f(const int x = 5)` -> "5)"), a Go type
+            // alias's RHS (`type Handler = http.HandlerFunc`) or a mutable
+            // binding's initialiser as if it were a constant value. Of the
+            // capture-name kinds the queries emit, only `const` is value-bearing:
+            // `#define` is emitted as `const`, whereas `static` is the MUTABLE
+            // module binding (Go `var`, Rust `static`, a C++ mutable global) and
+            // every other kind is structural. Gate the call on kind.
+            let value = if s.kind == "const" {
+                extract_value(lang, &decl)
+            } else {
+                None
+            };
+            xerj_common::hub::DefRecord {
+                symbol: s.name,
+                kind: s.kind,
+                lang: lang.to_string(),
+                file: file_rel.to_string(),
+                line: s.line as u32,
+                text: decl,
+                value,
+            }
+        })
+        .collect()
+}
+
 fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
     let mut parser = Parser::new();
     parser.set_language(&def.language).ok()?;
@@ -1269,6 +1395,8 @@ fn emit_code_doc(
     // So dedup by locator here, BEFORE counting/emitting — do not rely on the
     // downstream `_id` overwrite (which fixes the doc but not the count).
     let mut emitted_locators = std::collections::HashSet::new();
+    let lines: Vec<&str> = text.lines().collect();
+    const IMPL_CAP: usize = 16_384;
     for s in symbols {
         if s.code.is_empty() {
             continue;
@@ -1288,14 +1416,55 @@ fn emit_code_doc(
         sf.insert("name".into(), Value::String(name.clone()));
         sf.insert("kind".into(), Value::String(s.kind.clone()));
         sf.insert("line".into(), Value::Number((line as u64).into()));
+        sf.insert(
+            "end_line".into(),
+            Value::Number((s.end_line.max(line) as u64).into()),
+        );
         sf.insert("code".into(), Value::String(s.code.clone()));
-        // No field beyond the five #579 froze: a NEW scalar field on this
-        // document would make `reconcile_plan::ensure_compatible` (see
-        // reconcile_plan.rs, "field {name} is absent from frozen dataset")
-        // abort the next incremental run over an index an older binary froze.
-        // `end_line` therefore rides in the file document's `symbols` array,
-        // which that check exempts because an array carries no scalar
-        // observations (the #580/#581 rule).
+        // #1237: symbol records carry a bounded `impl` slice (`body[line..=end_line]`,
+        // capped at 16 KB on a UTF-8 char boundary) so `xerj code --fuse-symbols`
+        // can score a second BM25 leg over definition bodies without length-norm
+        // dilution from a 4,000-line file. For every kind except
+        // `function`/`method` (i.e. containers: `class`, `module`, `trait`,
+        // `interface`, `impl`, `struct`, `extension`, ...), bound `impl` to the
+        // lines preceding the first nested definition so member bodies are not
+        // duplicated inside the enclosing record. Functions keep their whole
+        // body: a nested closure/inner def is part of what the function does.
+        // `reconcile_plan::ensure_compatible` exempts `impl` and `end_line` on
+        // pre-#1237 frozen datasets so incremental runs over older state dirs
+        // never abort.
+        let impl_end_line = if !matches!(s.kind.as_str(), "function" | "method") {
+            symbols
+                .iter()
+                .filter(|child| child.line > line && child.line <= s.end_line)
+                .map(|child| child.line.saturating_sub(1).max(line))
+                .min()
+                .unwrap_or(s.end_line.max(line))
+        } else {
+            s.end_line.max(line)
+        };
+        if s.end_line > line
+            || matches!(
+                s.kind.as_str(),
+                "function" | "method" | "class" | "macro" | "struct" | "enum" | "trait" | "impl"
+            )
+        {
+            let lo = line.saturating_sub(1).min(lines.len());
+            let hi = impl_end_line.min(lines.len()).max(lo);
+            if hi > lo {
+                let mut impl_slice = lines[lo..hi].join("\n");
+                if impl_slice.len() > IMPL_CAP {
+                    let mut cut = IMPL_CAP;
+                    while cut > 0 && !impl_slice.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    impl_slice.truncate(cut);
+                }
+                if !impl_slice.is_empty() {
+                    sf.insert("impl".into(), Value::String(impl_slice));
+                }
+            }
+        }
         stats.records += 1;
         if !sink(RawRecord {
             fields: sf,
@@ -4203,5 +4372,197 @@ mod tests {
         assert!(has(&s, "mint", "function"), "got {s:?}");
         assert!(has(&s, "onlyOwner", "function"), "got {s:?}");
         assert!(has(&s, "min", "function"), "got {s:?}");
+    }
+
+    /// The five literal cases fixed by `docs/CORPUS_HUB_V2_IMPLEMENTATION.md`
+    /// step 3: each value regex returns exactly this string (trailing comment
+    /// and `;`/`,` removed), and a bare signature is not a value.
+    #[test]
+    fn extract_value_literals() {
+        // C `#define` with a trailing block comment: the token, comment dropped.
+        assert_eq!(
+            extract_value("c", "#define LZ4_VERSION_RELEASE  0    /* for tweaks */"),
+            Some("0".to_string())
+        );
+        // Rust `pub(crate) const` with a typed initialiser: the whole RHS.
+        assert_eq!(
+            extract_value(
+                "rust",
+                "pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);"
+            ),
+            Some("Duration::from_secs(30)".to_string())
+        );
+        // C `#define` whose value is a parenthesised conditional expression.
+        assert_eq!(
+            extract_value("c", "#define MDB_MAXKEYSIZE ((MDB_DEVEL) ? 0 : 511)"),
+            Some("((MDB_DEVEL) ? 0 : 511)".to_string())
+        );
+        // Go const-block line: the shift expression, no trailing semicolon.
+        assert_eq!(
+            extract_value("go", "batchSize = 16 << 20"),
+            Some("16 << 20".to_string())
+        );
+        // A function signature carries no value.
+        assert_eq!(extract_value("rust", "fn main() {"), None);
+    }
+
+    /// `definitions` turns parsed symbols into `DefRecord`s: a `const` carries
+    /// its literal value and the 1-based line its name sits on; a function none.
+    #[test]
+    fn definitions_rust_const_and_fn() {
+        // `pub const LIMIT` on line 1, `fn helper` on line 2.
+        let src = "pub const LIMIT: u32 = 128;\nfn helper() {}\n";
+        let defs = definitions("src/lib.rs", "rust", src);
+        let Some(limit) = defs.iter().find(|d| d.symbol == "LIMIT") else {
+            panic!("no LIMIT def in {defs:?}");
+        };
+        assert_eq!(limit.value, Some("128".to_string()), "got {limit:?}");
+        assert_eq!(limit.line, 1, "got {limit:?}");
+        // The function declaration, if captured, has no value.
+        if let Some(helper) = defs.iter().find(|d| d.symbol == "helper") {
+            assert_eq!(helper.value, None, "got {helper:?}");
+        }
+    }
+
+    /// Fix A: `definitions` attaches a `value` only to a constant-kind symbol.
+    /// `extract_value` is a per-language regex with no notion of symbol kind, so
+    /// run on EVERY symbol it reads a prototype's default argument, a type
+    /// alias's RHS or a mutable `var`/`static` initialiser as a constant value.
+    /// The kind gate stops that; a real `const` still carries its value.
+    #[test]
+    fn definitions_only_values_constant_kinds() {
+        // C++ function prototype: `= 5` is a parameter default, never a value.
+        for d in definitions("x.cpp", "cpp", "void f(const int x = 5);") {
+            assert_eq!(d.value, None, "cpp prototype leaked a value: {d:?}");
+        }
+        // Go `type` alias: the RHS is a type, not a value.
+        for d in definitions("x.go", "go", "package p\ntype Handler = http.HandlerFunc\n") {
+            assert_ne!(d.kind, "const", "a Go type alias is not a constant: {d:?}");
+            assert_eq!(d.value, None, "go type alias leaked a value: {d:?}");
+        }
+        // Go package-level `var`: a mutable binding (kind `static`), not a value.
+        // It is still indexed as a symbol; it simply carries no `value`.
+        let gv = definitions("x.go", "go", "package p\nvar DefaultPort = 8080\n");
+        assert!(
+            gv.iter().any(|d| d.symbol == "DefaultPort"),
+            "the Go var should still be a symbol: {gv:?}"
+        );
+        for d in &gv {
+            assert_eq!(d.value, None, "go var leaked a value: {d:?}");
+        }
+        // The gate must NOT suppress a genuine constant's value.
+        let rc = definitions("x.rs", "rust", "pub const LIMIT: u32 = 128;\n");
+        let limit = rc
+            .iter()
+            .find(|d| d.symbol == "LIMIT")
+            .expect("const LIMIT captured");
+        assert_eq!(limit.kind, "const");
+        assert_eq!(limit.value.as_deref(), Some("128"));
+    }
+
+    /// Fix B: a quoted value is kept whole — a `;` or `//` inside the string is
+    /// not a terminator — while non-string values extract exactly as before.
+    #[test]
+    fn extract_value_keeps_quoted_strings_intact() {
+        // `//` inside a C string is not the start of a comment.
+        assert_eq!(
+            extract_value("c", r#"#define PATH "/usr//local/bin""#),
+            Some(r#""/usr//local/bin""#.to_string())
+        );
+        // A URL's `//` must not truncate the value down to `"http:`.
+        assert_eq!(
+            extract_value("c", r#"#define API_URL "http://x.com""#),
+            Some(r#""http://x.com""#.to_string())
+        );
+        // `;` inside a Rust string literal is not the statement terminator.
+        assert_eq!(
+            extract_value("rust", r#"const S: &str = "a;b";"#),
+            Some(r#""a;b""#.to_string())
+        );
+        // Non-string values are untouched: the trailing comment and `;` still go.
+        assert_eq!(
+            extract_value("c", "#define LZ4_VERSION_RELEASE  0    /* for tweaks */"),
+            Some("0".to_string())
+        );
+    }
+
+    /// The container bound is not specific to `class`: a Rust `mod` holding a
+    /// function must not copy that function's body into its own `impl`.
+    #[test]
+    fn emit_code_doc_bounds_every_container_kind_before_nested_defs() {
+        let mut records = Vec::new();
+        let mut stats = ExtractStats::default();
+        let src = "mod engine {\n    use std::fmt;\n    fn spin_up() {\n        let unique_marker = 1;\n    }\n}\n";
+        let s = syms("rust", src);
+        assert!(has(&s, "engine", "module"), "got {s:?}");
+        assert!(has(&s, "spin_up", "function"), "got {s:?}");
+        assert!(emit_code_doc(
+            Path::new("lib.rs"),
+            "rust",
+            src,
+            &s,
+            &mut stats,
+            &mut |rec| {
+                records.push(rec);
+                true
+            },
+        ));
+        let module_impl = records
+            .iter()
+            .find(|r| r.locator == "code:1:engine")
+            .and_then(|r| r.fields.get("impl"))
+            .and_then(Value::as_str)
+            .expect("module impl");
+        assert_eq!(module_impl, "mod engine {\n    use std::fmt;");
+        assert!(!module_impl.contains("unique_marker"));
+        let fn_impl = records
+            .iter()
+            .find(|r| r.locator == "code:3:spin_up")
+            .and_then(|r| r.fields.get("impl"))
+            .and_then(Value::as_str)
+            .expect("function impl");
+        assert!(fn_impl.contains("unique_marker"), "{fn_impl}");
+    }
+
+    #[test]
+    fn emit_code_doc_records_symbol_impl_and_bounds_class_before_methods() {
+        let mut records = Vec::new();
+        let mut stats = ExtractStats::default();
+        let src =
+            "class Widget:\n    kind = 'box'\n    def render(self):\n        return self.kind\n";
+        let s = syms("python", src);
+        let ok = emit_code_doc(
+            Path::new("widget.py"),
+            "python",
+            src,
+            &s,
+            &mut stats,
+            &mut |rec| {
+                records.push(rec);
+                true
+            },
+        );
+        assert!(ok);
+        let class_rec = records
+            .iter()
+            .find(|r| r.locator == "code:1:Widget")
+            .expect("Widget symbol record");
+        assert_eq!(
+            class_rec.fields.get("impl").and_then(Value::as_str),
+            Some("class Widget:\n    kind = 'box'"),
+            "class impl stops before nested method definition so method bodies are not duplicated"
+        );
+        let method_rec = records
+            .iter()
+            .find(|r| r.locator == "code:3:render")
+            .expect("render symbol record");
+        assert_eq!(
+            method_rec.fields.get("impl").and_then(Value::as_str),
+            Some("    def render(self):\n        return self.kind")
+        );
+        assert_eq!(
+            method_rec.fields.get("end_line").and_then(Value::as_u64),
+            Some(4)
+        );
     }
 }

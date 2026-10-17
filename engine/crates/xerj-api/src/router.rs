@@ -28,8 +28,8 @@ use uuid::Uuid;
 use xerj_common::config::CorsConfig;
 
 use crate::{
-    ask_api, audit_mw, auth::auth_middleware, authz, es_compat, graph_api, ism_api, memory_api,
-    native, share, state::AppState, systemone_api, wal_tap_api,
+    ask_api, audit_mw, auth::auth_middleware, authz, es_compat, graph_api, hub_api, ism_api,
+    memory_api, native, share, state::AppState, systemone_api, wal_tap_api,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -243,6 +243,18 @@ pub fn build_native_router(state: AppState) -> Router {
 /// POST   /:index/_bulk                      bulk_ops
 /// ```
 pub fn build_es_compat_router(state: AppState) -> Router {
+    let hub = hub_api::HubShared::new(state.clone());
+    build_es_compat_router_with_hub(state, hub)
+}
+
+/// [`build_es_compat_router`] over a [`hub_api::HubShared`] the caller also
+/// hands to the gRPC `XerjHub` service, so the two surfaces count one client
+/// against ONE hub rate-limit budget (and share one query-slot pool and one
+/// catalogue cache) instead of each granting the full allowance.
+pub fn build_es_compat_router_with_hub(
+    state: AppState,
+    hub: std::sync::Arc<hub_api::HubShared>,
+) -> Router {
     let body_limit = state.config.limits.max_body_bytes;
     let access_log = state.config.logging.access_log;
     // Build the CORS layer before `state` is moved into the auth middleware.
@@ -922,6 +934,16 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         )
         .route("/_memory/:namespace/_recall", post(memory_api::recall))
         .route("/_memory/:namespace/:id", delete(memory_api::forget_one))
+        // ── Corpus Hub hosted endpoints ───────────────────────────────────────
+        // Four read-only GET routes that answer from the packs restored on this
+        // node (`hub_api.rs`; plan §6). Always mounted and keyed like every
+        // other route; with `hub.public = true` exactly these four skip
+        // authentication, authorization and the audit log (the three
+        // `*_unless_public_hub` wrappers below). The rate limit is a layer on
+        // the sub-router itself, so it holds in both modes. `hub` is the
+        // same `HubShared` the gRPC `XerjHub` service holds, so a client has
+        // one budget across both listeners, not one per listener.
+        .merge(hub_api::routes(hub))
         // ── Share links ───────────────────────────────────────────────────────
         // `xerj share`: hand one indexed corpus to a guest as a scoped,
         // read-only, expiring key. Create/list/revoke are superuser-only in
@@ -965,18 +987,18 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            authz::authz_middleware,
+            authz_unless_public_hub,
         ))
         // Between authn and authz, deliberately: outside authorization so a
         // refused write is recorded as `denied`, inside authentication so an
         // unauthenticated flood cannot evict a bounded ring (issue #329).
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            audit_mw::audit_middleware,
+            audit_unless_public_hub,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            auth_middleware,
+            auth_unless_public_hub,
         ))
         // OUTSIDE authentication, so the `401` and `403` the two layers above
         // produce for `/_share…` are `no-store` too — the handlers only cover
@@ -998,6 +1020,57 @@ pub fn build_es_compat_router(state: AppState) -> Router {
         // client libraries) — without this every such request 400s/500s
         // trying to JSON-parse raw gzip bytes.
         .layer(RequestDecompressionLayer::new().gzip(true))
+}
+
+// ── hub.public ───────────────────────────────────────────────────────────────
+//
+// With `hub.public = true`, exactly the four hosted-hub routes
+// (`hub_api::is_public_path`, an exact-shape match, any method) skip the three
+// layers below; every other request goes through them untouched. They are
+// wrappers here, not edits to `auth.rs` / `authz.rs` / `audit_mw.rs`, so the
+// security modules stay exactly as reviewed and the whole exemption is the
+// short predicate in `hub_api.rs`.
+//
+// All three are skipped, not just authentication: authorization would refuse a
+// request with no principal, and the audit layer records every unauthenticated
+// write-shaped request — a public route must not be a way to flush the bounded
+// audit ring (issue #329). A `POST` to one of the four reaches the router and
+// gets its `405`; no handler exists for it.
+
+/// [`auth_middleware`], except for the public hub routes.
+async fn auth_unless_public_hub(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if hub_api::is_public_request(&state, &req) {
+        return next.run(req).await;
+    }
+    auth_middleware(State(state), req, next).await
+}
+
+/// [`audit_mw::audit_middleware`], except for the public hub routes.
+async fn audit_unless_public_hub(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if hub_api::is_public_request(&state, &req) {
+        return next.run(req).await;
+    }
+    audit_mw::audit_middleware(State(state), req, next).await
+}
+
+/// [`authz::authz_middleware`], except for the public hub routes.
+async fn authz_unless_public_hub(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if hub_api::is_public_request(&state, &req) {
+        return next.run(req).await;
+    }
+    authz::authz_middleware(State(state), req, next).await
 }
 
 /// Everything under `/_share` is `Cache-Control: no-store`, whoever produced

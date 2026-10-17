@@ -262,7 +262,7 @@ fn configured_members(config: &xerj_common::config::Config) -> Vec<(String, std:
 /// Node count for `/_cluster/health`: `1` when cluster mode is off, else the
 /// distinct configured membership (own address + peers, so a peer list that
 /// also names this node is not double-counted).
-fn configured_node_count(config: &xerj_common::config::Config) -> u32 {
+pub(crate) fn configured_node_count(config: &xerj_common::config::Config) -> u32 {
     if !config.cluster.enabled {
         return 1;
     }
@@ -2056,9 +2056,8 @@ async fn get_index_inner(
         };
 
         // Settings: replay what was written (normalized to strings), merged
-        // with engine defaults; `analysis` is the block in force (#1092).
-        // Creation timestamps are synthesized because we don't persist them
-        // yet (TODO).
+        // with engine defaults; `analysis` is the block in force (#1092) and
+        // `creation_date` is the persisted creation time (#1573).
         let settings_inner = index_settings_response(&state, name, idx.as_ref(), human).await;
 
         let mut index_obj = serde_json::Map::new();
@@ -2110,7 +2109,12 @@ async fn index_settings_response(
             stored = i.get_settings().await;
         }
     }
-    let mut settings = merge_settings_defaults(&stored, name, human);
+    // Creation timestamps: the real persisted value (#1573), not a fresh
+    // `Utc::now()` per request. `index_created_at` is recorded at create and
+    // loaded from `created_at.json` on boot; the fallback only covers an
+    // index that has no recorded time (e.g. a failed create).
+    let created_at_ms = state.engine.index_created_at.get(name).map(|v| *v);
+    let mut settings = merge_settings_defaults(&stored, name, human, created_at_ms);
     if let Some(i) = idx {
         let in_force = i.analysis_in_force().await;
         if let Some(inner) = settings.get_mut("index").and_then(Value::as_object_mut) {
@@ -2128,7 +2132,12 @@ async fn index_settings_response(
 /// ES always wraps user settings under `{ "index": { ... } }` and coerces
 /// all simple values to strings. Missing fields fall through to engine
 /// defaults (single shard, zero replicas).
-fn merge_settings_defaults(user_settings: &Value, provided_name: &str, human: bool) -> Value {
+fn merge_settings_defaults(
+    user_settings: &Value,
+    provided_name: &str,
+    human: bool,
+    created_at_ms: Option<i64>,
+) -> Value {
     // Pull the inner `index` block if the user used `{ "index": { ... } }`
     // syntax; otherwise treat the whole blob as the inner block.
     let raw_inner = user_settings
@@ -2161,11 +2170,14 @@ fn merge_settings_defaults(user_settings: &Value, provided_name: &str, human: bo
         }
     }
 
-    // Synthesize required fields if absent.
-    let now_ms = Utc::now().timestamp_millis();
+    // Synthesize required fields if absent. `creation_date` prefers the
+    // persisted creation time: a client comparing two `GET /{index}` calls
+    // must see one stable value (index age, ILM-style tooling). The `now`
+    // fallback is only for an index with no recorded time.
+    let created_ms = created_at_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
     inner
         .entry("creation_date".to_string())
-        .or_insert_with(|| Value::String(now_ms.to_string()));
+        .or_insert_with(|| Value::String(created_ms.to_string()));
     // Emit the stable, deterministic index uuid — the SAME value
     // _cat/indices reports — rather than a fresh random one per request.
     inner.insert(
@@ -2683,10 +2695,39 @@ pub async fn get_settings_all(State(state): State<AppState>) -> impl IntoRespons
     get_settings(State(state), Path("_all".to_string())).await
 }
 
+/// ES `indices.get_mapping`: a concrete name that is not an index or an
+/// alias is `404 index_not_found_exception`. A wildcard (including one that
+/// matches nothing) is not this case — that stays the empty-target path,
+/// same split `_cat/indices` already documents.
+pub(crate) fn first_missing_concrete_name(
+    spec: &str,
+    known: impl Fn(&str) -> bool,
+) -> Option<&str> {
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if part == "_all" || part == "*" || part.contains('*') {
+            continue;
+        }
+        if !known(part) {
+            return Some(part);
+        }
+    }
+    None
+}
+
 pub async fn get_mapping(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
+    let names = state.engine.index_name_list();
+    let failed = state.engine.list_failed_indices();
+    if let Some(missing) = first_missing_concrete_name(&index, |part| {
+        names.iter().any(|n| n == part)
+            || failed.iter().any(|f| f.name == part)
+            || state.engine.aliases.contains_key(part)
+    }) {
+        let e = xerj_common::XerjError::index_not_found(missing);
+        return ApiError::new(e).into_response();
+    }
     let targets = resolve_index_selector(&state, &index).await;
     if targets.is_empty() {
         let e = xerj_common::XerjError::index_not_found(&index);
@@ -2804,6 +2845,101 @@ fn inject_bbq_rescore_defaults(node: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod get_mapping_missing_index {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[test]
+    fn a_concrete_missing_name_is_reported_and_a_wildcard_is_not() {
+        let known = |p: &str| p == "logs" || p == "metrics";
+        assert_eq!(first_missing_concrete_name("nope", known), Some("nope"));
+        assert_eq!(first_missing_concrete_name("logs", known), None);
+        assert_eq!(
+            first_missing_concrete_name("logs,nope", known),
+            Some("nope")
+        );
+        // A wildcard that matches nothing is not a concrete miss. The empty
+        // result stays on the existing path so the YAML suite's wildcard
+        // cases are unchanged.
+        assert_eq!(first_missing_concrete_name("nope*", known), None);
+        assert_eq!(first_missing_concrete_name("_all", known), None);
+        assert_eq!(first_missing_concrete_name("*", known), None);
+        assert_eq!(first_missing_concrete_name("logs*", known), None);
+    }
+
+    /// ES `indices.get_mapping`: `GET /nope/_mapping` is 404, not 200 `{}`.
+    /// A name that exists still returns its mapping. A wildcard is not this
+    /// check — `nope*` stays on the empty-target path.
+    #[tokio::test]
+    async fn get_mapping_404s_a_concrete_missing_name_and_returns_a_real_one() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("body", FieldType::Text));
+        state.engine.create_index("logs", schema).unwrap();
+        let router = crate::router::build_es_compat_router(state);
+
+        let missing = router
+            .clone()
+            .oneshot(Request::get("/nope/_mapping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(missing.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "index_not_found_exception");
+        assert_eq!(json["error"]["reason"], "no such index [nope]");
+
+        let mixed = router
+            .clone()
+            .oneshot(
+                Request::get("/logs,nope/_mapping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed.status(), StatusCode::NOT_FOUND);
+
+        let found = router
+            .clone()
+            .oneshot(Request::get("/logs/_mapping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(found.status(), StatusCode::OK);
+        let bytes = to_bytes(found.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("logs").is_some(), "{json}");
+
+        // Wildcard miss is not rewritten by the concrete check. Empty targets
+        // already 404; this pins that the new branch did not turn it into 200.
+        let wild = router
+            .oneshot(Request::get("/nope*/_mapping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(wild.status(), StatusCode::NOT_FOUND);
     }
 }
 
@@ -10205,6 +10341,82 @@ fn search_actor_class(size: usize, index: &str) -> &'static str {
     }
 }
 
+/// How a search the node issues to ITSELF differs from one that arrived over
+/// HTTP. Only [`crate::hub_api`]'s in-process caller sets it, around the one
+/// internal request it makes; a request off the wire cannot carry it, because it
+/// is a task-local and not a header, a parameter or a body field.
+///
+/// Both effects exist because the hosted hub's routes are public and a pack's
+/// contents are not the operator's: neither may be a lever on the node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InProcessSearch {
+    /// Do not append this search to the audit ring. The ring is a bounded piece
+    /// of operator evidence shared by the whole node (4,096 entries); a public
+    /// route that appended one entry per request would let a crowd of strangers
+    /// age every earlier entry out of it. The HTTP access log still records the
+    /// request.
+    pub skip_audit: bool,
+    /// A fan-out over several indices skips an index whose search fails — it
+    /// is counted in `_shards.failed` and logged — instead of failing the whole
+    /// request. One pack with an unusable mapping must not take `search` down
+    /// for every other pack. When EVERY index fails the first failure is still
+    /// returned, so an outage never reads as "no results".
+    pub skip_failed_indices: bool,
+}
+
+tokio::task_local! {
+    static IN_PROCESS_SEARCH: InProcessSearch;
+}
+
+/// Run `fut` — the whole internal request, handler included — with `mode`
+/// installed. Same shape as `xerj_engine::index_guard::scoped`, and for the same
+/// reason: the handler reads it on the task that drives `fut`.
+pub(crate) async fn scoped_in_process_search<F>(mode: InProcessSearch, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    IN_PROCESS_SEARCH.scope(mode, fut).await
+}
+
+/// The mode the current request runs under; the default (a request off the
+/// wire, or engine-internal work) changes nothing.
+fn in_process_search() -> InProcessSearch {
+    IN_PROCESS_SEARCH.try_with(|m| *m).unwrap_or_default()
+}
+
+/// Bookkeeping for [`InProcessSearch::skip_failed_indices`]: how many indices a
+/// fan-out tried, how many failed, and the first failure to report if all did.
+#[derive(Default)]
+struct SkippedIndices {
+    searched: u32,
+    failed: u32,
+    first_failure: Option<Response>,
+}
+
+impl SkippedIndices {
+    /// One more index was attempted.
+    fn attempt(&mut self) {
+        self.searched += 1;
+    }
+
+    /// An attempted index failed with `why`; keep the first such response.
+    fn skip(&mut self, why: impl FnOnce() -> Response) {
+        self.failed += 1;
+        if self.first_failure.is_none() {
+            self.first_failure = Some(why());
+        }
+    }
+
+    /// The failure to answer with when nothing at all could be searched.
+    fn all_failed(self) -> Option<Response> {
+        if self.failed > 0 && self.failed == self.searched {
+            self.first_failure
+        } else {
+            None
+        }
+    }
+}
+
 async fn search_impl(
     state: AppState,
     index: String,
@@ -10213,6 +10425,9 @@ async fn search_impl(
     body: EsSearchJson,
 ) -> Response {
     let started = Instant::now();
+    // Read once, before the first `.await`: what the in-process hub caller asked
+    // of this search. A request off the wire gets the default and is unaffected.
+    let in_process = in_process_search();
     // Closed-index handling is deferred to after index resolution below so
     // `ignore_unavailable` / `expand_wildcards` are honored per ES semantics.
 
@@ -10590,8 +10805,7 @@ async fn search_impl(
         .iter()
         .any(|n| *n == "_all" || n.contains('*') || state.engine.aliases.contains_key(*n));
     let index_names: Vec<String> = if needs_resolve {
-        let all = state.engine.list_indices().await;
-        let all_names: Vec<String> = all.into_iter().map(|i| i.name).collect();
+        let all_names = state.engine.index_name_list();
         let mut resolved: Vec<String> = Vec::new();
         for pattern in &raw_names {
             if *pattern == "_all" || *pattern == "*" {
@@ -12546,6 +12760,8 @@ async fn search_impl(
     // and excess searches queue on that semaphore deadline-aware exactly as
     // they did when this loop issued them one at a time.
     let mut spawned_searches = Vec::with_capacity(index_names.len());
+    // Only used when an in-process caller asked to have failing indices skipped.
+    let mut skipped = SkippedIndices::default();
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
             Ok(i) => i,
@@ -12554,18 +12770,25 @@ async fn search_impl(
                     // Silently skip; behaves like an empty index.
                     continue;
                 }
+                if in_process.skip_failed_indices {
+                    // An index that is listed but cannot be opened is one bad
+                    // index, not a reason to refuse the rest.
+                    tracing::warn!(
+                        index = %idx_name,
+                        error = ?e.to_string().chars().take(300).collect::<String>(),
+                        "in-process search: index unavailable, skipping it"
+                    );
+                    skipped.attempt();
+                    skipped.skip(|| ApiError::new(xerj_common::XerjError::from(e)).into_response());
+                    shards_failed_count += 1;
+                    continue;
+                }
                 let mut api_err = ApiError::new(xerj_common::XerjError::from(e));
                 // Byte-parity `reason` ("no such index [name]") is fixed by
                 // ES-compat tests and set unconditionally in `error.rs` — this
                 // only adds the additive `_xerj` hint alongside it.
                 if matches!(api_err.inner, xerj_common::XerjError::IndexNotFound { .. }) {
-                    let available: Vec<String> = state
-                        .engine
-                        .list_indices()
-                        .await
-                        .into_iter()
-                        .map(|i| i.name)
-                        .collect();
+                    let available = state.engine.index_name_list();
                     api_err = api_err.with_hint(index_not_found_hint(idx_name, &available));
                 }
                 return api_err.into_response();
@@ -12651,6 +12874,7 @@ async fn search_impl(
             }
             idx.search(&req_clone).await
         }));
+        skipped.attempt();
         spawned_searches.push((idx_name, search_task));
     }
 
@@ -12663,9 +12887,29 @@ async fn search_impl(
 
         match search_result {
             Err(join_err) => {
+                if in_process.skip_failed_indices {
+                    tracing::warn!(index = %idx_name, "in-process search: index search panicked, skipping it");
+                    skipped.skip(|| search_task_panic_response(join_err, idx_name));
+                    shards_failed_count += 1;
+                    continue;
+                }
                 return search_task_panic_response(join_err, idx_name);
             }
-            Ok(Err(e)) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            Ok(Err(e)) => {
+                if in_process.skip_failed_indices {
+                    // The engine's own words can quote the query; bound and
+                    // escape them before they reach the log.
+                    tracing::warn!(
+                        index = %idx_name,
+                        error = ?e.to_string().chars().take(300).collect::<String>(),
+                        "in-process search: index search failed, skipping it"
+                    );
+                    skipped.skip(|| ApiError::new(xerj_common::XerjError::from(e)).into_response());
+                    shards_failed_count += 1;
+                    continue;
+                }
+                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+            }
             Ok(Ok(result)) => {
                 // A Painless resource limit tripped somewhere in scoring or
                 // aggregation. Those paths have no error channel, so they
@@ -12748,6 +12992,13 @@ async fn search_impl(
                 }
             }
         }
+    }
+
+    // Skipping a bad index is isolation, not a way to hide an outage: when every
+    // index that was tried failed there is nothing to answer from, and the first
+    // failure is the answer.
+    if let Some(failure) = skipped.all_failed() {
+        return failure;
     }
 
     // ── Post-merge `auto_date_histogram` re-coordination ────────────────────
@@ -13305,39 +13556,44 @@ async fn search_impl(
         started.elapsed(),
         merged_hits.len() as u64,
         if body.aggs.is_some() { "with-aggs" } else { "" },
-        &body
-            .query
-            .as_ref()
-            .map(|q| q.to_string())
-            .unwrap_or_default(),
+        // An omitted `query` (match_all) or a top-level `knn` with no query
+        // clause used to log `query=` empty. `logged_search_query` records
+        // the clause the engine actually ran.
+        &xerj_engine::slow_query::logged_search_query(body.query.as_ref(), body.knn.as_ref()),
     );
     // v0.9 9-P4: append to the audit log. The subject was the literal
     // "anonymous" until issue #329 — the API-key operations had been passing a
     // real `principal.label()` since #201, so the plumbing existed and this one
     // site simply did not use it.
-    state.engine.audit.append_as(
-        // #1109: the machine/user split is decided HERE, server-side, from
-        // what the request itself is — never from anything a client can set
-        // (the spoofable `X-Xerj-Internal` header was considered and
-        // rejected during #1107, and that decision stands). See
-        // `search_actor_class` for exactly which requests are machine.
-        search_actor_class(body.size, index.as_str()),
-        "search",
-        principal.label(),
-        index.as_str(),
-        "ok",
-        // `size=` is the requested page size. A `size:0` search asks for no
-        // hits — it is a counting probe (autoindex's verification reads back
-        // exact group counts that way), not someone looking for documents,
-        // and `xerj gain` needs exactly that distinction to report a hit
-        // rate that is about people (#1105).
-        &format!(
-            "took={}ms hits={} size={}",
-            took_ms,
-            merged_hits.len(),
-            body.size
-        ),
-    );
+    //
+    // Not for a search the hosted hub issues to itself (`InProcessSearch`): that
+    // is a public read, and one audit entry per request would let anyone age the
+    // operator's evidence out of the ring.
+    if !in_process.skip_audit {
+        state.engine.audit.append_as(
+            // #1109: the machine/user split is decided HERE, server-side, from
+            // what the request itself is — never from anything a client can set
+            // (the spoofable `X-Xerj-Internal` header was considered and
+            // rejected during #1107, and that decision stands). See
+            // `search_actor_class` for exactly which requests are machine.
+            search_actor_class(body.size, index.as_str()),
+            "search",
+            principal.label(),
+            index.as_str(),
+            "ok",
+            // `size=` is the requested page size. A `size:0` search asks for no
+            // hits — it is a counting probe (autoindex's verification reads back
+            // exact group counts that way), not someone looking for documents,
+            // and `xerj gain` needs exactly that distinction to report a hit
+            // rate that is about people (#1105).
+            &format!(
+                "took={}ms hits={} size={}",
+                took_ms,
+                merged_hits.len(),
+                body.size
+            ),
+        );
+    }
 
     // ES semantics: when the sort has any non-score key, `max_score` is null
     // (scores aren't tracked during field-sorted execution unless
@@ -20476,6 +20732,32 @@ fn count_shard_failure(index: &str, rendered: &Value) -> Value {
     json!({ "shard": 0, "index": index, "reason": reason })
 }
 
+/// Locator of an autoindex file-card anchor. Must stay equal to
+/// `xerj_autoindex::detect::FILE_CARD_LOCATOR` (`"file"`). The card is a real
+/// document so graph edges can resolve it, and it is not a content record.
+const FILE_CARD_LOCATOR: &str = "file";
+
+/// `stats.doc_count` minus file-card anchors. A bare `_count` is what
+/// `xerj autoindex map` and agents read as the record count; one card per
+/// file was inflating it. An explicit query is left alone, so a caller who
+/// asks for `ax_locator: file` still gets those documents, and a term query
+/// that cannot run (the field is absent) leaves the stat count unchanged.
+async fn content_doc_count(idx: &xerj_engine::index::Index) -> u64 {
+    let total = idx.stats().await.doc_count;
+    let body = json!({
+        "query": {"term": {"ax_locator": FILE_CARD_LOCATOR}},
+        "size": 0,
+        "track_total_hits": true
+    });
+    let Ok(req) = xerj_query::parse_request(&body) else {
+        return total;
+    };
+    match idx.search(&req).await {
+        Ok(result) if result.script_failure.is_none() => total.saturating_sub(result.total.value),
+        _ => total,
+    }
+}
+
 pub async fn count_docs_global(
     State(state): State<AppState>,
     Query(params): Query<CountParams>,
@@ -20516,16 +20798,16 @@ pub async fn count_docs(
         || index.contains('*')
         || alias_selector
     {
-        let all = state.engine.list_indices().await;
-        let all_names: Vec<String> = all.into_iter().map(|i| i.name).collect();
         let wanted: Vec<String> = if index == "_all" || index == "*" {
-            all_names.clone()
+            state.engine.index_name_list()
         } else {
+            let mut all_names: Option<Vec<String>> = None;
             let mut out = Vec::new();
             for pat in index.split(',') {
                 let pat = pat.trim();
                 if pat.contains('*') {
-                    for n in &all_names {
+                    let all_names = all_names.get_or_insert_with(|| state.engine.index_name_list());
+                    for n in all_names.iter() {
                         if glob_match_simple(pat, n) && !out.contains(n) {
                             out.push(n.clone());
                         }
@@ -20647,7 +20929,7 @@ pub async fn count_docs(
                     }
                 }
             } else {
-                total += idx.stats().await.doc_count;
+                total += content_doc_count(&idx).await;
                 successful += 1;
             }
         }
@@ -20723,7 +21005,7 @@ pub async fn count_docs(
             }
         }
     } else {
-        idx.stats().await.doc_count
+        content_doc_count(&idx).await
     };
 
     let mut body_out = json!({
@@ -22252,17 +22534,12 @@ async fn resolve_selector_with_filters(
 }
 
 async fn resolve_index_selector(state: &AppState, spec: &str) -> Vec<String> {
-    let all: Vec<String> = state
-        .engine
-        .list_indices()
-        .await
-        .into_iter()
-        .map(|i| i.name)
-        .collect();
+    let mut all: Option<Vec<String>> = None;
     let mut out: Vec<String> = Vec::new();
     for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if part == "_all" || part == "*" {
-            for n in &all {
+            let all = all.get_or_insert_with(|| state.engine.index_name_list());
+            for n in all.iter() {
                 if !out.contains(n) {
                     out.push(n.clone());
                 }
@@ -22270,7 +22547,8 @@ async fn resolve_index_selector(state: &AppState, spec: &str) -> Vec<String> {
             continue;
         }
         if part.contains('*') {
-            for n in &all {
+            let all = all.get_or_insert_with(|| state.engine.index_name_list());
+            for n in all.iter() {
                 if glob_match_simple(part, n) && !out.contains(n) {
                     out.push(n.clone());
                 }
@@ -22323,17 +22601,12 @@ async fn resolve_indices_for_op(
     spec: &str,
 ) -> Result<Vec<(String, std::sync::Arc<xerj_engine::Index>)>, xerj_common::XerjError> {
     let is_selector = spec == "_all" || spec.contains('*') || spec.contains(',');
-    let all: Vec<String> = state
-        .engine
-        .list_indices()
-        .await
-        .into_iter()
-        .map(|i| i.name)
-        .collect();
+    let mut all: Option<Vec<String>> = None;
     let mut names: Vec<String> = Vec::new();
     for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if part == "_all" || part.contains('*') {
-            for n in &all {
+            let all = all.get_or_insert_with(|| state.engine.index_name_list());
+            for n in all.iter() {
                 // ES excludes hidden (dot-prefixed) indices from default
                 // wildcard/_all expansion — `POST /*/_close` must never
                 // sweep in `.xerj_users`-class system indices. A pattern
@@ -22351,7 +22624,7 @@ async fn resolve_indices_for_op(
             // A concrete name may be a real index OR an alias. An index of
             // that name wins, matching ES, where an alias may not share a
             // name with an index.
-            if all.iter().any(|n| n == part) {
+            if state.engine.has_open_index(part) {
                 if !names.iter().any(|n| n == part) {
                     names.push(part.to_string());
                 }
@@ -24695,13 +24968,7 @@ pub async fn field_caps(
     // any other wildcard as a literal (non-existent) index/alias name,
     // silently returning empty field caps for wildcarded index patterns.
     let resolved_indices: Vec<String> = if index == "*" || index == "_all" {
-        state
-            .engine
-            .list_indices()
-            .await
-            .into_iter()
-            .map(|i| i.name)
-            .collect()
+        state.engine.index_name_list()
     } else {
         resolve_index_selector(&state, &index).await
     };
@@ -25765,13 +26032,7 @@ async fn msearch_impl(
         let index_names: Vec<String> = if let Some(pit) = pit_context.as_ref() {
             pit.indices.clone()
         } else if index_name == "*" || index_name == "_all" {
-            state
-                .engine
-                .list_indices()
-                .await
-                .into_iter()
-                .map(|i| i.name)
-                .collect()
+            state.engine.index_name_list()
         } else {
             index_name
                 .split(',')
@@ -33168,13 +33429,15 @@ pub async fn restore_snapshot(
 // GET  /_cluster/pending_tasks
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn get_cluster_settings(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn get_cluster_settings(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     let settings = state.engine.cluster_settings.read().await;
-    let persistent = settings.get("persistent").cloned().unwrap_or(json!({}));
-    let transient = settings.get("transient").cloned().unwrap_or(json!({}));
+    let flat = flat_settings_param(&params);
     Json(json!({
-        "persistent": persistent,
-        "transient": transient,
+        "persistent": render_settings(settings.get("persistent"), flat),
+        "transient": render_settings(settings.get("transient"), flat),
         "defaults": {},
     }))
     .into_response()
@@ -33182,23 +33445,79 @@ pub async fn get_cluster_settings(State(state): State<AppState>) -> impl IntoRes
 
 pub async fn put_cluster_settings(
     State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let mut settings = state.engine.cluster_settings.write().await;
-    if let Some(persistent) = body.get("persistent") {
-        settings["persistent"] = persistent.clone();
+    // ES merges an update into the stored settings, keyed by the flat dotted
+    // name whichever form the request used, and `null` removes a setting.
+    // The response lists only the settings this request set.
+    let mut updated = json!({ "persistent": {}, "transient": {} });
+    for scope in ["persistent", "transient"] {
+        let Some(update) = body.get(scope) else {
+            continue;
+        };
+        let mut flat = serde_json::Map::new();
+        flatten_settings("", update, &mut flat);
+        if !settings[scope].is_object() {
+            settings[scope] = json!({});
+        }
+        if let Some(stored) = settings[scope].as_object_mut() {
+            for (key, value) in flat {
+                if value.is_null() {
+                    stored.remove(&key);
+                } else {
+                    updated[scope][key.as_str()] = value.clone();
+                    stored.insert(key, value);
+                }
+            }
+        }
     }
-    if let Some(transient) = body.get("transient") {
-        settings["transient"] = transient.clone();
-    }
-    let persistent = settings.get("persistent").cloned().unwrap_or(json!({}));
-    let transient = settings.get("transient").cloned().unwrap_or(json!({}));
+    let flat = flat_settings_param(&params);
     Json(json!({
         "acknowledged": true,
-        "persistent": persistent,
-        "transient": transient,
+        "persistent": render_settings(updated.get("persistent"), flat),
+        "transient": render_settings(updated.get("transient"), flat),
     }))
     .into_response()
+}
+
+/// `?flat_settings` / `?flat_settings=true`; ES defaults to the nested form.
+fn flat_settings_param(params: &std::collections::HashMap<String, String>) -> bool {
+    matches!(
+        params.get("flat_settings").map(String::as_str),
+        Some("" | "true")
+    )
+}
+
+/// Settings are stored under flat dotted keys; render them nested unless the
+/// caller asked for `flat_settings`.
+fn render_settings(stored: Option<&Value>, flat: bool) -> Value {
+    let stored = stored.cloned().unwrap_or(json!({}));
+    if flat {
+        stored
+    } else {
+        expand_dotted_keys(stored)
+    }
+}
+
+/// Flattens `{"a": {"b": 1}}` into `{"a.b": 1}`.
+fn flatten_settings(prefix: &str, value: &Value, out: &mut serde_json::Map<String, Value>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let key = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten_settings(&key, child, out);
+            }
+        }
+        _ => {
+            out.insert(prefix.to_string(), value.clone());
+        }
+    }
 }
 
 pub async fn cluster_reroute(
@@ -36135,13 +36454,7 @@ async fn msearch_template_impl(
         };
 
         let index_names: Vec<String> = if index_name == "*" || index_name == "_all" {
-            state
-                .engine
-                .list_indices()
-                .await
-                .into_iter()
-                .map(|i| i.name)
-                .collect()
+            state.engine.index_name_list()
         } else {
             index_name
                 .split(',')
@@ -38752,14 +39065,13 @@ pub async fn global_field_caps(
     Query(params): Query<GlobalFieldCapsParams>,
     _body: Option<Json<Value>>,
 ) -> impl IntoResponse {
-    let indices = state.engine.list_indices().await;
-    let index_names: Vec<String> = indices.iter().map(|i| i.name.clone()).collect();
+    let index_names = state.engine.index_name_list();
     let fields_filter = params.fields.as_deref().unwrap_or("*");
 
     let mut fields_map: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
 
-    for index_info in &indices {
-        let idx = match state.engine.get_index(&index_info.name) {
+    for index_name in &index_names {
+        let idx = match state.engine.get_index(index_name) {
             Ok(i) => i,
             Err(_) => continue,
         };
@@ -38772,7 +39084,7 @@ pub async fn global_field_caps(
         let stored_mapping = state
             .engine
             .index_mappings
-            .get(index_info.name.as_str())
+            .get(index_name.as_str())
             .map(|v| v.clone())
             .unwrap_or(Value::Null);
         let mut live_properties = schema_to_es_properties(&schema);
@@ -38803,7 +39115,7 @@ pub async fn global_field_caps(
                 "",
                 &properties,
                 fields_filter,
-                &index_info.name,
+                index_name,
                 &mut fields_map,
             );
         }
@@ -38836,11 +39148,8 @@ pub async fn global_field_caps(
                 })
             });
             if let Some(arr) = type_entry["indices"].as_array_mut() {
-                if !arr
-                    .iter()
-                    .any(|v| v.as_str() == Some(index_info.name.as_str()))
-                {
-                    arr.push(Value::String(index_info.name.clone()));
+                if !arr.iter().any(|v| v.as_str() == Some(index_name.as_str())) {
+                    arr.push(Value::String(index_name.clone()));
                 }
             }
         }
@@ -43515,10 +43824,10 @@ async fn run_rollup_job(state: &AppState, job_id: &str, config: &Value) -> Resul
     }
 
     // Resolve source indices (exclude the rollup_index itself).
-    let all = state.engine.list_indices().await;
-    let matches: Vec<String> = all
-        .iter()
-        .map(|i| i.name.clone())
+    let matches: Vec<String> = state
+        .engine
+        .index_name_list()
+        .into_iter()
         .filter(|n| n != &rollup_index && wildcard_match(&index_pattern, n))
         .collect();
     if matches.is_empty() {

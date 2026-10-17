@@ -3067,12 +3067,16 @@ fn parse_hybrid(params: &Value) -> Result<QueryNode> {
         .iter()
         .enumerate()
         .map(|(i, v)| {
-            let entry = v
-                .as_object()
-                .ok_or_else(|| qerr(format!("`hybrid.queries[{i}]` must be an object")))?;
-            let q_val = entry
-                .get("query")
-                .ok_or_else(|| qerr(format!("`hybrid.queries[{i}]` missing `query`")))?;
+            let entry = v.as_object().ok_or_else(|| {
+                qerr(format!(
+                    "`hybrid.queries[{i}]` must be an object {{\"query\": <clause>, \"weight\": <number>}}"
+                ))
+            })?;
+            let q_val = entry.get("query").ok_or_else(|| {
+                qerr(format!(
+                    "`hybrid.queries[{i}]` missing `query`; each item is {{\"query\": <clause>, \"weight\": <number>}} (weight defaults to 1)"
+                ))
+            })?;
             let query = parse_query(q_val)?;
             let weight = entry.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             Ok(WeightedQuery { query, weight })
@@ -6168,6 +6172,38 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn hybrid_item_missing_query_names_the_query_weight_shape() {
+        let err = parse_query(&json!({
+            "hybrid": {
+                "queries": [
+                    {"weight": 1.0},
+                    {"query": {"match_all": {}}}
+                ]
+            }
+        }))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`hybrid.queries[0]` missing `query`"), "{msg}");
+        assert!(
+            msg.contains("{\"query\": <clause>, \"weight\": <number>}"),
+            "{msg}"
+        );
+        assert!(msg.contains("weight defaults to 1"), "{msg}");
+
+        let err = parse_query(&json!({
+            "hybrid": { "queries": ["rotate keys"] }
+        }))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "`hybrid.queries[0]` must be an object {\"query\": <clause>, \"weight\": <number>}"
+            ),
+            "{msg}"
+        );
     }
 
     #[test]

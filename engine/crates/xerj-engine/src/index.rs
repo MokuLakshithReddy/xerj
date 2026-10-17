@@ -719,6 +719,75 @@ mod collection_publication_fail_closed_tests {
         assert_eq!(result.hits.first().map(|hit| hit.id.as_str()), Some("one"));
     }
 
+    /// A publication bracket held for the whole merge repoint used to pin
+    /// `_search` until the bracket dropped, and the deadline used to come
+    /// back as an error. A retrying client then spent the deadline again.
+    /// The page must stop at `timeout` and say it is partial.
+    #[tokio::test]
+    async fn search_waiting_on_a_publication_stops_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("epoch-deadline", text_schema())
+            .unwrap();
+        let idx = engine.get_index("epoch-deadline").unwrap();
+        idx.index_document(Some("one".into()), json!({"body": "alpha"}))
+            .await
+            .unwrap();
+
+        let mut publication = idx.collection_publication.begin().unwrap();
+        let request = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "alpha"}},
+            "size": 10,
+            "timeout": "200ms"
+        }))
+        .unwrap();
+        let started = std::time::Instant::now();
+        let result = idx
+            .search(&request)
+            .await
+            .expect("a missed deadline is a partial page, not an error");
+        let elapsed = started.elapsed();
+        publication.cancel();
+        drop(publication);
+        assert!(
+            result.timed_out,
+            "a bracket held past the deadline must set timed_out"
+        );
+        assert!(
+            result.hits.is_empty(),
+            "admission never captured a view: {:?}",
+            result.hits
+        );
+        assert!(
+            matches!(
+                result.total.relation,
+                xerj_query::executor::TotalHitsRelation::Gte
+            ),
+            "an uncaptured total is a lower bound, not zero"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "search must stop at its deadline, took {elapsed:?}"
+        );
+        // The bracket was cancelled, not dropped pending, so the index
+        // still answers once the publication is gone.
+        let again = idx
+            .search(
+                &xerj_query::parse_request(&json!({
+                    "query": {"match": {"body": "alpha"}},
+                    "size": 10
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!again.timed_out);
+        assert_eq!(again.hits.first().map(|hit| hit.id.as_str()), Some("one"));
+    }
+
     // #1013 fail-before. Sustained ingest takes a publication bracket per
     // doc write, so writer-free *instants* exist but writer-free *intervals*
     // long enough to cover a whole search do not. The churn thread here
@@ -2673,6 +2742,57 @@ mod flush_publication_recovery_tests {
             after > before,
             "#804 a flush must increment xerj_bytes_written_total: before={before} after={after}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_flush_does_not_enqueue_shard_finalize_work() {
+        // #1226 — a `_refresh` / `delete_by_query?refresh=true` on an index
+        // whose memtable holds nothing to drain must NOT contend for flush
+        // admission. Pre-fix, `flush()` fanned a `do_flush_shard` task out for
+        // EVERY shard regardless of contents; each task first takes a
+        // per-index `flush_sema` permit and then the process-global
+        // `flush_finalize_gate`, discovering the shard is empty only after it
+        // has queued behind every other index's in-flight finalize. That is
+        // the "latency tracks concurrent write load, not index size" symptom
+        // in #1226: a no-op refresh still paid one admission wait per shard.
+        //
+        // We prove the fix without touching the shared global gate (which the
+        // rest of the parallel suite depends on): exhaust this index's OWN
+        // `flush_sema` so that any shard task that got spawned would block
+        // forever on `acquire_owned`, then flush an empty memtable. With the
+        // fix no shard task is spawned, so the flush completes (its durability
+        // tail needs no flush permit). Without the fix the coordinator would
+        // await 16 tasks wedged on the exhausted semaphore and time out.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine.create_index("empty-flush", Schema::empty()).unwrap();
+        let idx = engine.get_index("empty-flush").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(
+            idx.memtable.doc_count(),
+            0,
+            "precondition: the memtable must be empty"
+        );
+
+        // Take every per-index flush permit and hold it for the whole flush.
+        let permits = idx.flush_sema.available_permits() as u32;
+        assert!(permits > 0, "flush_sema must start with permits to hold");
+        let _held = idx
+            .flush_sema
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), idx.flush())
+            .await
+            .expect(
+                "#1226: an empty flush must not wait on flush admission — no shard \
+                 finalize should have been enqueued",
+            )
+            .expect("flush of an empty memtable must succeed");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11993,6 +12113,15 @@ impl Index {
         // still fires shard flushes in parallel.
         let n_shards = self.memtable.shard_count();
         for shard_idx in 0..n_shards {
+            // #1226 — skip empty shards (same reasoning as `flush()`): a
+            // no-op shard finalize still acquires the process-global
+            // `flush_finalize_gate`, so an empty shard would make this
+            // serial refresh wait behind unrelated indices' ingest flushes
+            // for nothing. Bound the work to the shards actually holding
+            // documents.
+            if self.memtable.shard_load(shard_idx).0 == 0 {
+                continue;
+            }
             do_flush_shard(
                 shard_idx,
                 Arc::clone(&self.store),
@@ -19662,12 +19791,37 @@ impl Index {
         Ok(())
     }
 
+    /// A deadline that expired before any hit was captured. Counted as a
+    /// query (the wait was real work) and never cached: the caller is in
+    /// `search`, ahead of `search_at_generation`'s cache lookup.
+    fn deadline_exhausted_result(&self, started: std::time::Instant) -> SearchResult {
+        let took_ms = started.elapsed().as_millis() as u64;
+        self.metric_query_count.fetch_add(1, Ordering::Relaxed);
+        self.metric_query_total_ms
+            .fetch_add(took_ms, Ordering::Relaxed);
+        SearchResult {
+            hits: vec![],
+            total: xerj_query::executor::TotalHits {
+                value: 0,
+                relation: TotalHitsRelation::Gte,
+            },
+            took_ms,
+            aggs: None,
+            timed_out: true,
+            profile: None,
+            max_score: None,
+            script_failure: None,
+            savings: None,
+        }
+    }
+
     /// Execute a search request against this index.
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
         use crate::collection_publication::ReadAdmission;
 
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
+        let started = std::time::Instant::now();
+        let deadline =
+            started + std::time::Duration::from_millis(request.timeout_ms.unwrap_or(30_000));
         loop {
             let token = loop {
                 let notified = self.collection_publication.notified();
@@ -19678,14 +19832,25 @@ impl Index {
                     ReadAdmission::Poisoned => {
                         return Err(collection_publication_interrupted());
                     }
+                    // A merge publication holds this bracket across the
+                    // version-map repoint. Waiting it out, then failing the
+                    // request, is what turned a 30s deadline into minutes:
+                    // the HTTP layer maps the error to 500 and a retrying
+                    // client spends another deadline on the same bracket.
+                    // Elasticsearch answers a missed deadline with HTTP 200
+                    // and `timed_out: true`. The hits are empty because
+                    // admission never captured a view — `total.relation`
+                    // is `gte`, so the page is a bound, not an empty corpus.
                     ReadAdmission::WriterActive => {
-                        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), notified)
-                            .await
-                            .map_err(|_| {
-                                EngineError::Fts(anyhow::anyhow!(
-                                    "search waited for a stable collection publication until its deadline"
-                                ))
-                            })?;
+                        if tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(deadline),
+                            notified,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return Ok(self.deadline_exhausted_result(started));
+                        }
                     }
                 }
             };
@@ -19710,9 +19875,7 @@ impl Index {
                     if std::time::Instant::now() < deadline {
                         continue;
                     }
-                    return Err(EngineError::Fts(anyhow::anyhow!(
-                        "search could not capture a stable collection view before its deadline"
-                    )));
+                    return Ok(self.deadline_exhausted_result(started));
                 }
                 other => return other,
             }
@@ -20901,6 +21064,37 @@ impl Index {
             }
             (tf, ef, kw, num, bf)
         };
+        // #1359: `query_node_to_fts_projected` projects a `QueryNode::Term` on a
+        // `FieldType::Keyword` field into `FtsQuery::Term` so a `bool` or
+        // `dis_max` combining a text clause and a keyword `term` clause does
+        // not `?`-abort FTS projection on the keyword child. A standalone
+        // top-level `term` on a keyword field, however, is served by
+        // `scored_columnar` when `mem_doc_count == 0` and by the doc-values
+        // prefilter + stored scan (where memtable `DocValuesHits` and segment
+        // `score_doc` both assign constant score `1.0`) when `mem_doc_count > 0`
+        // or columnar bails. Routing a top-level keyword `term` into segment FTS
+        // gave segment hits BM25 (~0.00147) while memtable `DocValuesHits` gave
+        // `1.0` — so `seg_can_enter` rejected every flushed segment against a
+        // full memtable collector (`size:1` returned `mem000` over `seg0000`)
+        // and `query_needs_fts` flipped true on a `term`-on-keyword query.
+        let empty_kw_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let fts_kw_fields: &std::collections::HashSet<String> = {
+            let mut q = query;
+            loop {
+                match q {
+                    QueryNode::Constant { query, .. }
+                    | QueryNode::Boosted { query, .. }
+                    | QueryNode::Named { query, .. } => q = query,
+                    other => {
+                        break if matches!(other, QueryNode::Term { .. }) {
+                            &empty_kw_fields
+                        } else {
+                            &kw_fields
+                        };
+                    }
+                }
+            }
+        };
 
         // ── B3: peeled function_score for the brute path ──────────────────
         // The single scoring clause of the request when it is a (wrapped)
@@ -21437,7 +21631,7 @@ impl Index {
                         query,
                         &text_fields,
                         &exact_fields,
-                        &kw_fields,
+                        fts_kw_fields,
                         mem_doc_count,
                         pinned_probe,
                     )
@@ -21445,6 +21639,8 @@ impl Index {
                 })
                 .clone()
         };
+
+        let unindexed_dv_text_match = has_unindexed_doc_values_text_match(query, &dmq_schema);
 
         let mem_snapshot = {
             let mem = &*self.memtable;
@@ -21540,6 +21736,12 @@ impl Index {
                     let extra = total.saturating_sub(ids.len() as u64);
                     MemSnapshot::AllDocIds(ids, extra)
                 }
+            } else if unindexed_dv_text_match {
+                // These fields have no memtable postings. Route direct Match,
+                // normalized bool-Match, and DisMax-of-Match shapes through
+                // the mapping-aware scan so pre-flush answers use the same
+                // whole-value column semantics as flushed documents.
+                MemSnapshot::DocsForScan(mem.all_docs_with_seq_arc())
             } else if let Some((dm_subs, dm_tie)) = dis_max_mem_fts_subs(query) {
                 // #834: a `dis_max` of single-field text `match` subs used
                 // to fall through to the stored-doc scan, whose scorer has
@@ -22194,7 +22396,7 @@ impl Index {
             query,
             &text_fields,
             &exact_fields,
-            &kw_fields,
+            fts_kw_fields,
             self.segment_analyzer_binding(),
             pinned_probe,
         )
@@ -22441,7 +22643,7 @@ impl Index {
                 query,
                 &text_fields,
                 &exact_fields,
-                &kw_fields,
+                fts_kw_fields,
                 self.segment_analyzer_binding(),
                 pinned_probe,
             );
@@ -22457,7 +22659,7 @@ impl Index {
                     query,
                     &text_fields,
                     &exact_fields,
-                    &kw_fields,
+                    fts_kw_fields,
                     self.segment_analyzer_binding(),
                     pinned_probe,
                 );
@@ -22612,17 +22814,19 @@ impl Index {
                 let seg_id = meta.id.clone();
                 let fts_dir = segments_dir.clone();
 
-                // #191 — on the count-authoritative stored-scan path each
-                // segment gets its OWN `materialisation_limit` of headroom:
-                // `scan_stored_section_into` stops at
-                // `all_hits.len() >= limit`, so a collector already filled by
-                // an earlier segment would let a genuinely competitive segment
-                // contribute nothing.  Positions inside a segment ARE `seq_no`
-                // order (`drain_for_flush` and the merge both sort by
-                // `seq_no`), so this segment's first `cap` matches are its own
-                // `cap` best; the merge below then re-selects the global best
-                // `cap`.  Peak is 2×cap, trimmed at the bottom of the loop.
-                let scan_limit = if count_authoritative && !count_only && sort_topk.is_none() {
+                // #191 / #1359 — on the stored-scan path each segment gets its
+                // OWN `materialisation_limit` of headroom, whether or not
+                // `count_authoritative` is set: `scan_stored_section_into` stops
+                // materialising hits at `all_hits.len() >= limit` (continuing to
+                // tally `total_count` when `!count_authoritative`), so a
+                // collector already filled by an earlier segment or the memtable
+                // would otherwise let a genuinely competitive segment contribute
+                // zero hits.  Positions inside a segment ARE `seq_no` order
+                // (`drain_for_flush` and the merge both sort by `seq_no`), so
+                // this segment's first `cap` matches are its own `cap` best; the
+                // merge below then re-selects the global best `cap`.  Peak is
+                // 2×cap, trimmed at the bottom of the loop.
+                let scan_limit = if !count_only && sort_topk.is_none() {
                     all_hits.len().saturating_add(materialisation_limit)
                 } else {
                     materialisation_limit
@@ -22683,7 +22887,7 @@ impl Index {
                         query,
                         &text_fields,
                         &exact_fields,
-                        &kw_fields,
+                        fts_kw_fields,
                         self.segment_analyzer_binding(),
                         pinned_positions
                             .as_ref()
@@ -23634,6 +23838,13 @@ impl Index {
                         }
                         match &sort_cand {
                             Some(sc) => Some(Arc::new(PrefilterSet::from_set(sc.set.clone()))),
+                            // An analyzed `text` field's column holds raw
+                            // values, not tokens: its term set is not a
+                            // superset of the scan's matches, so decline
+                            // (`None` → full stored scan, which answers per
+                            // the pre-flush hit set — see
+                            // `field_is_analyzed_text`).
+                            None if field_is_analyzed_text(&dmq_schema, field) => None,
                             None => self.build_term_prefilter_cached(
                                 &segments_dir,
                                 &seg_id,
@@ -23660,6 +23871,10 @@ impl Index {
                         }
                         match &sort_cand {
                             Some(sc) => Some(Arc::new(PrefilterSet::from_set(sc.set.clone()))),
+                            // Same analyzed-`text` decline as the Term arm
+                            // above: the column stores raw values, so a set
+                            // built from it would drop every token-only match.
+                            None if field_is_analyzed_text(&dmq_schema, field) => None,
                             None => self.build_term_prefilter_cached(
                                 &segments_dir,
                                 &seg_id,
@@ -23685,7 +23900,16 @@ impl Index {
                         // Pure-conjunction bool: parse only the most-selective
                         // conjunct's docs; `doc_matches_query` re-tests the full
                         // bool per admitted doc (superset filter).
-                        self.build_bool_prefilter_cached(&segments_dir, &seg_id, query)
+                        //
+                        // A bool carrying a term/terms leaf on an analyzed
+                        // `text` field has no valid doc-values anchor at all
+                        // (see `field_is_analyzed_text`) — decline the whole
+                        // prefilter, the stored scan answers.
+                        if has_analyzed_text_term_leaf(query, &dmq_schema) {
+                            None
+                        } else {
+                            self.build_bool_prefilter_cached(&segments_dir, &seg_id, query)
+                        }
                     } else if is_match_all && !deletes_present {
                         // Sorted-DV candidate pruning for field-sorted
                         // match_all: the segment's sorted numeric
@@ -24069,7 +24293,7 @@ impl Index {
                 // Trimmed hits stay in `seen_ids`: the cap-th key only ever
                 // improves, so a document that lost the trim can never become
                 // competitive again.
-                if count_authoritative
+                if !fts_handled
                     && !count_only
                     && sort_topk.is_none()
                     && all_hits.len() != hits_before_segment
@@ -25234,6 +25458,25 @@ impl Index {
         let coordinator = tokio::spawn(async move {
             let mut shard_futures = Vec::with_capacity(n_shards);
             for shard_idx in 0..n_shards {
+                // #1226 — do not fan a finalize out for an EMPTY shard.
+                //
+                // `do_flush_shard` acquires the *process-global*
+                // `flush_finalize_gate` (a handful of permits shared by every
+                // index) before it discovers the shard has nothing to drain,
+                // and it first takes a per-index `flush_sema` permit. Under a
+                // multi-index bulk storm that global gate is saturated by
+                // other indices' ingest flushes, so each no-op shard task
+                // still queues behind the whole backlog. A user-visible
+                // `_refresh` / `delete_by_query?refresh=true` therefore paid
+                // one full admission wait PER SHARD even when the memtable was
+                // already drained — the "latency tracks write load, not index
+                // size" signature in #1226. Skipping empty shards bounds a
+                // flush's finalize-admission cost to the shards it actually
+                // has to drain; an all-empty memtable now does zero finalize
+                // work (just the durability tail below).
+                if memtable.shard_load(shard_idx).0 == 0 {
+                    continue;
+                }
                 let sema = Arc::clone(&flush_sema);
                 let store = Arc::clone(&store);
                 let memtable = Arc::clone(&memtable);
@@ -27393,6 +27636,17 @@ impl Index {
             QueryNode::Constant { query, .. } | QueryNode::Boosted { query, .. } => query.as_ref(),
             _ => query,
         };
+        // Analyzed-text leaves first: every count below is built from
+        // doc-values columns, and those are exact only where the column holds
+        // what `_search` matches. For a `text` field with doc-values the
+        // column holds RAW values while the scan matches TOKENS, so any count
+        // derived from it (the Term/Terms arms and the Bool arm's resolver)
+        // would drop exactly the token-only matches the pre-flush answer has.
+        // Decline the whole shortcut and let the counting scan answer — the
+        // same `None` route a field with no column already takes.
+        if has_analyzed_text_term_leaf(query, schema) {
+            return None;
+        }
         // Bool intersection shortcut — for `bool { must: [Term, Range] }`
         // (the most common production filter shape) compute the matching
         // doc-id set per segment via doc-values intersection, no scan.
@@ -33005,6 +33259,17 @@ async fn do_flush_shard(
     warm_caches: PublishWarmCaches,
     #[cfg(test)] test_hook: Option<FlushPublisherTestHook>,
 ) -> Result<()> {
+    // #1226 — re-check emptiness BEFORE the process-global finalize gate.
+    // `Index::refresh`/`Index::flush` already skip shards that look empty
+    // when they build the fan-out (#1319), but this task may have waited on
+    // `flush_sema` since then while a concurrent flush drained the shard,
+    // and the ingest-triggered paths call in here directly. Same outcome as
+    // the empty-drain branch below (`on_drained` fired, nothing published),
+    // minus a wait behind every other index's in-flight finalize.
+    if memtable.shard_load(shard_idx).0 == 0 {
+        on_drained();
+        return Ok(());
+    }
     // Acquire admission before draining. Once the memtable has been drained
     // there must be no cancellation point until a non-cancellable blocking
     // worker owns both rollback data and the publication barrier.
@@ -39641,6 +39906,27 @@ fn refine_code_passage(
     crate::code_blocks::enclosing_block(language, text, start, end)
 }
 
+/// Whether `source` has the shape autoindex's code extractor writes
+/// (`xerj-autoindex/src/extract/code.rs`): a whole-file document carries a
+/// numeric `symbol_count` (the signal [`refine_code_passage`] keys on); a
+/// per-symbol document carries exactly `name` + `kind` + `code` + a numeric
+/// `line` + `language`. Same conservatism as `refine_code_passage`: a field
+/// called `name` or `body` on an arbitrary document is not enough.
+fn is_autoindex_code_document(source: &Value) -> bool {
+    if matches!(
+        get_field_value(source, "symbol_count"),
+        Some(Value::Number(_))
+    ) {
+        return true;
+    }
+    let is_str = |field: &str| matches!(get_field_value(source, field), Some(Value::String(_)));
+    is_str("name")
+        && is_str("kind")
+        && is_str("code")
+        && is_str("language")
+        && matches!(get_field_value(source, "line"), Some(Value::Number(_)))
+}
+
 /// Maximum byte length of a query-time lexical `_passage` window.
 ///
 /// Sized so an agent gets enough surrounding code to read an implementation
@@ -40007,6 +40293,22 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
             if candidates.is_empty() {
                 return hit;
             }
+            // #1364: on an autoindex CODE document, `name`/`defs`/`title` are
+            // synthetic identifier fields (a one-word symbol name, a symbol
+            // list) whose source lives in `code` (per-symbol docs) or `body`
+            // (whole-file docs). Cross-field ties go to the first candidate,
+            // so `xerj search`'s `name^4`-first field list returned the bare
+            // word `de` as the passage of `de <- function(col) {...}`. Move the
+            // source fields ahead — a stable reorder of fields the query
+            // ALREADY targets, never an added field: a passage must come from
+            // a field the query named (the #174 contract), and an ordinary
+            // document that merely has `name`/`body` fields keeps the query's
+            // own field order.
+            if is_autoindex_code_document(&hit.source) {
+                candidates.sort_by_key(|(field_name, ..)| {
+                    !matches!(field_name.as_str(), "code" | "body")
+                });
+            }
             // Document-level term rarity across all candidate fields,
             // squared so one term's total contribution stays bounded (see
             // the weighting note in this function's doc comment).
@@ -40033,26 +40335,29 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                         // `refine_code_passage` would usually force it back
                         // to the tree root (the padding routinely spills
                         // outside the enclosing function) and silently no-op
-                        // the refinement. Anchor on one actual query-term
-                        // occurrence inside the window instead — any point
-                        // inside the matched region resolves to the same
-                        // enclosing block. ASCII-lowercase only (not the
-                        // Unicode-aware `lower`/`map` used above): it never
-                        // changes byte length, so `pos` lines up with `text`
-                        // without a second offset table; source identifiers
+                        // the refinement. Anchor on the highest-weight (rarest)
+                        // query-term occurrence inside the window (#1364) so a
+                        // common term in the leading context padding cannot pull
+                        // the AST refinement onto an adjacent block. ASCII-lowercase
+                        // only (not the Unicode-aware `lower`/`map` used above):
+                        // it never changes byte length, so `pos` lines up with
+                        // `text` without a second offset table; source identifiers
                         // are ASCII in the overwhelming case, and a missed
                         // non-ASCII anchor just skips the refinement, not a
                         // correctness bug.
-                        let (start, end) = weighted_terms
-                            .iter()
-                            .find_map(|&(term, _)| {
-                                if term.is_empty() {
-                                    return None;
-                                }
-                                text.get(start..end)?
-                                    .to_ascii_lowercase()
-                                    .find(term)
-                                    .map(|pos| start + pos)
+                        let window_lower = text.get(start..end).map(str::to_ascii_lowercase);
+                        let (start, end, ordinal) = window_lower
+                            .as_deref()
+                            .and_then(|win| {
+                                weighted_terms
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, &(term, _))| !term.is_empty())
+                                    .filter_map(|(idx, &(term, weight))| {
+                                        win.find(term).map(|pos| (weight, idx, start + pos))
+                                    })
+                                    .max_by(|a, b| a.0.total_cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+                                    .map(|(_, _, anchor)| anchor)
                             })
                             .and_then(|anchor| {
                                 let anchor_end = (anchor + 1).min(text.len());
@@ -40064,7 +40369,12 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                                     anchor_end,
                                 )
                             })
-                            .unwrap_or((start, end));
+                            .map(|(r_start, r_end)| {
+                                let r_ordinal =
+                                    text[..r_start].bytes().filter(|&b| b == b'\n').count() as u32;
+                                (r_start, r_end, r_ordinal)
+                            })
+                            .unwrap_or((start, end, ordinal));
                         best = Some((
                             score,
                             PassageMatch {
@@ -41305,6 +41615,113 @@ fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig
         None
     }
     find(&schema.fields, &field.split('.').collect::<Vec<_>>())
+}
+
+/// Is `field` an ANALYZED `text` field in `schema`?
+///
+/// Such a field's doc-values column — when its mapping asks for one (ES's
+/// `mapper.text.doc_values`) — holds the RAW `_source` values, while `_search`
+/// resolves a `term`/`terms` leaf against the analyzed token stream
+/// (`tokens_contain` in `doc_matches_query_typed` — the answer the memtable
+/// gives before any flush). A set built from the column is therefore NOT a
+/// superset of the segment's matches, and every consumer that treats it as one
+/// (the term/terms prefilters, the doc-values count shortcuts) silently drops
+/// the token-only matches once the document flushes. Those paths must decline
+/// and let the stored scan answer.
+///
+/// Only INDEXED text qualifies. An `"index": false` text field with doc-values
+/// has no token stream to match against: ES answers `term`/`terms` on it from
+/// the column, by whole value (`aggregations/terms_text_docvalues.yml`), so the
+/// column-derived set is exactly right there and must keep being used.
+fn field_is_analyzed_text(schema: &Schema, field: &str) -> bool {
+    declared_field(schema, field)
+        .is_some_and(|f| matches!(f.field_type, FieldType::Text) && f.options.indexed)
+}
+
+/// Does `q` contain a `match` leaf for declared doc-values-only text?
+fn has_unindexed_doc_values_text_match(q: &QueryNode, schema: &Schema) -> bool {
+    match q {
+        QueryNode::Match { field, .. } => declared_field(schema, field).is_some_and(|f| {
+            matches!(f.field_type, FieldType::Text) && !f.options.indexed && f.options.doc_values
+        }),
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => must
+            .iter()
+            .chain(should)
+            .chain(must_not)
+            .chain(filter)
+            .any(|child| has_unindexed_doc_values_text_match(child, schema)),
+        QueryNode::DisMax { queries, .. } => queries
+            .iter()
+            .any(|child| has_unindexed_doc_values_text_match(child, schema)),
+        QueryNode::Constant { query, .. }
+        | QueryNode::Boosted { query, .. }
+        | QueryNode::Named { query, .. }
+        | QueryNode::Nested { query, .. }
+        | QueryNode::FunctionScore { query, .. } => {
+            has_unindexed_doc_values_text_match(query, schema)
+        }
+        QueryNode::Pinned { organic, .. } => has_unindexed_doc_values_text_match(organic, schema),
+        QueryNode::Boosting {
+            positive, negative, ..
+        } => {
+            has_unindexed_doc_values_text_match(positive, schema)
+                || has_unindexed_doc_values_text_match(negative, schema)
+        }
+        _ => false,
+    }
+}
+
+/// Does `q` carry a `term`/`terms` leaf naming an analyzed `text` field?
+///
+/// The doc-values shapes [`field_is_analyzed_text`] cannot resolve are
+/// declined as a whole when this is true. Mirrors the composite arms of
+/// `unsearchable_query_field` so every position a leaf can sit in is walked.
+fn has_analyzed_text_term_leaf(q: &QueryNode, schema: &Schema) -> bool {
+    match q {
+        QueryNode::Term { field, .. } | QueryNode::Terms { field, .. } => {
+            field_is_analyzed_text(schema, field)
+        }
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => must
+            .iter()
+            .chain(should)
+            .chain(must_not)
+            .chain(filter)
+            .any(|c| has_analyzed_text_term_leaf(c, schema)),
+        QueryNode::Constant { query, .. }
+        | QueryNode::Boosted { query, .. }
+        | QueryNode::Named { query, .. }
+        | QueryNode::Nested { query, .. }
+        | QueryNode::FunctionScore { query, .. } => has_analyzed_text_term_leaf(query, schema),
+        QueryNode::Pinned { organic, .. } => has_analyzed_text_term_leaf(organic, schema),
+        QueryNode::Boosting {
+            positive, negative, ..
+        } => {
+            has_analyzed_text_term_leaf(positive, schema)
+                || has_analyzed_text_term_leaf(negative, schema)
+        }
+        QueryNode::DisMax { queries, .. } => queries
+            .iter()
+            .any(|c| has_analyzed_text_term_leaf(c, schema)),
+        QueryNode::Hybrid { queries, .. } => queries
+            .iter()
+            .any(|wq| has_analyzed_text_term_leaf(&wq.query, schema)),
+        QueryNode::Knn { filter, .. } | QueryNode::SemanticSearch { filter, .. } => filter
+            .as_ref()
+            .is_some_and(|f| has_analyzed_text_term_leaf(f, schema)),
+        _ => false,
+    }
 }
 
 /// The first field in `q` that the mapping has made completely unsearchable.
@@ -45471,6 +45888,15 @@ fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Schema) -> bo
             if values.iter().any(|v| json_values_equal(&doc_val, v)) {
                 return true;
             }
+            // A declared unindexed text field has no analyzed token stream.
+            // With doc values, ES answers term-level queries from whole raw
+            // column values; do not manufacture a whitespace-token match.
+            // Undeclared fields retain the legacy fallback below.
+            if declared_field(schema, field)
+                .is_some_and(|f| matches!(f.field_type, FieldType::Text) && !f.options.indexed)
+            {
+                return false;
+            }
             // Text-field fallback: if the doc has a string with whitespace
             // (i.e. looks tokenized), treat each space-separated token as a
             // candidate match. This mirrors ES's behavior of running `terms`
@@ -45918,6 +46344,50 @@ fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Schema) -> bo
             // default (standard/simple/lowercase etc.) lowercases both
             // sides like the existing path.
             let preserve_case = matches!(analyzer.as_deref(), Some("whitespace") | Some("keyword"));
+            let unindexed_doc_values_text = declared_field(schema, field).is_some_and(|f| {
+                matches!(f.field_type, FieldType::Text)
+                    && !f.options.indexed
+                    && f.options.doc_values
+            });
+
+            if unindexed_doc_values_text {
+                // ES analyzes only the query for this mapping, then compares
+                // its tokens against whole, case-sensitive doc-value strings.
+                // The field's `_source` value is never tokenized.
+                let q_tokens: Vec<String> = match analyzer.as_deref() {
+                    Some("keyword") => vec![query.clone()],
+                    Some("whitespace") => query.split_whitespace().map(str::to_string).collect(),
+                    _ => phrase_tokens(query),
+                };
+                if q_tokens.is_empty() {
+                    return false;
+                }
+                let need = match operator {
+                    xerj_query::ast::BoolOperator::And => q_tokens.len(),
+                    xerj_query::ast::BoolOperator::Or => match minimum_should_match {
+                        None => 1,
+                        Some(MinShouldMatch::Fixed(n)) => *n as usize,
+                        Some(MinShouldMatch::Percentage(pct)) => {
+                            ((q_tokens.len() as f32 * (*pct as f32 / 100.0)).floor() as usize)
+                                .max(1)
+                        }
+                        Some(other) => other.required(q_tokens.len()).unwrap_or(1),
+                    },
+                };
+                let raw_values: Vec<String> = match get_field_value(source, field) {
+                    Some(Value::String(value)) => vec![value],
+                    Some(Value::Array(values)) => values
+                        .into_iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let matched = q_tokens
+                    .iter()
+                    .filter(|token| raw_values.iter().any(|value| value == *token))
+                    .count();
+                return matched >= need;
+            }
             // When the query string parses as a date AND the field value
             // is a date (or array of dates), switch to date-aware equality:
             // the field value is coerced to epoch ms so
@@ -56338,6 +56808,318 @@ mod lexical_passage_tests {
             passage.text,
             &body[passage.start_offset as usize..passage.end_offset as usize]
         );
+        assert_eq!(
+            passage.ordinal as usize,
+            body[..passage.start_offset as usize].matches('\n').count(),
+            "ordinal must be recomputed after refine_code_passage widens/snaps start_offset"
+        );
+        assert_eq!(passage.ordinal, 80);
+    }
+
+    /// #1365: when `defs` is listed before `body` (as `xerj def`'s and the
+    /// pre-#1364 `xerj search` field lists did), a single-symbol match whose
+    /// window score ties between `defs` and `body` on an autoindex code
+    /// document must extract the passage from `body` at the declaration's
+    /// line ordinal, never from the synthetic `defs` symbol list at
+    /// `ordinal: 0`. When the query does NOT target `body`, the passage stays
+    /// in a field it did target (the #174 contract) — `xerj search` then
+    /// prints the bare path rather than a wrong `:1`.
+    #[test]
+    fn defs_field_never_captures_passage_over_a_targeted_code_body() {
+        let body = format!(
+            "{}pub fn check_invariants(x: i32) -> bool {{\n    x > 0\n}}\n{}",
+            "// header filler\n".repeat(40),
+            "// footer filler\n".repeat(40)
+        );
+        let source = json!({
+            "body": body,
+            "defs": "fn check_invariants",
+            "language": "rust",
+            "symbol_count": 1
+        });
+
+        for (fields, body_targeted) in [
+            (
+                vec![
+                    "name^4".to_string(),
+                    "defs^3".to_string(),
+                    "code^2".to_string(),
+                    "body".to_string(),
+                    "title".to_string(),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    "name^4".to_string(),
+                    "defs^3".to_string(),
+                    "code^2".to_string(),
+                    "title".to_string(),
+                ],
+                false,
+            ),
+        ] {
+            let query = QueryNode::MultiMatch {
+                fields,
+                query: "check_invariants".into(),
+                match_type: Default::default(),
+                operator: None,
+                analyzer: None,
+                boost: None,
+                slop: 0,
+                max_expansions: 50,
+                lenient: false,
+            };
+            let hit = Hit {
+                id: "doc-code-1".into(),
+                score: 1.0,
+                source: source.clone(),
+                seq_no: None,
+                version: None,
+                sort: Vec::new(),
+                explain: None,
+                highlight: None,
+                matched_queries: Vec::new(),
+                passage: None,
+            };
+            let out = apply_lexical_passages(vec![hit], &query);
+            let passage = out[0].passage.as_ref().expect("lexical passage filled");
+            if !body_targeted {
+                assert_eq!(
+                    passage.field, "defs",
+                    "`body` was not targeted, so it must not be the source: {passage:?}"
+                );
+                continue;
+            }
+            assert_eq!(passage.field, "body");
+            assert!(
+                passage.text.starts_with("pub fn check_invariants"),
+                "expected enclosing declaration from body, got {:?}",
+                passage.text
+            );
+            assert_eq!(passage.ordinal, 40);
+        }
+    }
+
+    /// #1364: on a per-symbol code hit (`name: "de"`, `title: "de"`, `code:
+    /// "de <- function(col)"`), `_passage` must come from `code` rather than
+    /// the single-word `name` field; and when a multi-word query hits a
+    /// whole-file document where a common glue token (`"de"`) appears in an
+    /// adjacent function just above the rarer target token
+    /// (`"factor_calibracion"`), `refine_code_passage` must anchor on the
+    /// highest-weight matched query term in the window rather than the first
+    /// alphabetically sorted term.
+    #[test]
+    fn code_lexical_passage_prefers_code_over_name_and_anchors_on_rarest_term() {
+        // 1. Per-symbol hit: `code` wins over `name` and `title`.
+        let symbol_source = serde_json::json!({
+            "ax_path": "R/utils.R",
+            "language": "r",
+            "symbol_count": 1,
+            "name": "de",
+            "title": "de",
+            "code": "de <- function(col) {\n  trimws(col)\n}",
+        });
+        let symbol_query = QueryNode::MultiMatch {
+            fields: vec![
+                "name^4".into(),
+                "defs^3".into(),
+                "code^2".into(),
+                "body".into(),
+                "title".into(),
+            ],
+            query: "de".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+            lenient: false,
+        };
+        let symbol_hit = Hit {
+            id: "sym-de".into(),
+            score: 1.0,
+            source: symbol_source,
+            seq_no: None,
+            version: None,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let out = apply_lexical_passages(vec![symbol_hit], &symbol_query);
+        let passage = out[0].passage.as_ref().expect("symbol passage filled");
+        assert_eq!(passage.field, "code");
+        assert!(
+            passage.text.starts_with("de <- function(col)"),
+            "expected function body from `code`, got {:?}",
+            passage.text
+        );
+
+        // 2. Whole-file hit: common token `de` appears frequently across the
+        // file and in an adjacent helper right above `pub fn compute_calibration`,
+        // while `factor_calibracion` appears only inside `compute_calibration`.
+        let mut body = String::new();
+        for i in 0..25 {
+            body.push_str(&format!("// comentario de relleno linea {i}\n"));
+        }
+        body.push_str(
+            "pub fn helper_anterior() {\n    // nota de control\n    let x = 1;\n}\n\n\
+             pub fn compute_calibration() -> f64 {\n    let factor_calibracion = 0.85;\n    factor_calibracion\n}\n",
+        );
+        let file_source = serde_json::json!({
+            "ax_path": "src/calib.rs",
+            "language": "rust",
+            "symbol_count": 2,
+            "defs": "helper_anterior compute_calibration",
+            "title": "calib",
+            "body": body,
+        });
+        let file_query = QueryNode::MultiMatch {
+            fields: vec![
+                "name^4".into(),
+                "code^2".into(),
+                "body".into(),
+                "defs^3".into(),
+                "title".into(),
+            ],
+            query: "de factor_calibracion".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+            lenient: false,
+        };
+        let file_hit = Hit {
+            id: "file-calib".into(),
+            score: 1.0,
+            source: file_source,
+            seq_no: None,
+            version: None,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        };
+        let out = apply_lexical_passages(vec![file_hit], &file_query);
+        let passage = out[0].passage.as_ref().expect("file passage filled");
+        assert_eq!(passage.field, "body");
+        assert!(
+            passage.text.starts_with("pub fn compute_calibration"),
+            "expected enclosing function of rarest matched term, got {:?}",
+            passage.text
+        );
+    }
+
+    fn passage_hit(id: &str, source: serde_json::Value) -> Hit {
+        Hit {
+            id: id.into(),
+            score: 1.0,
+            source,
+            seq_no: None,
+            version: None,
+            sort: Vec::new(),
+            explain: None,
+            highlight: None,
+            matched_queries: Vec::new(),
+            passage: None,
+        }
+    }
+
+    /// #1364 review: the `code`-over-`name` preference must never make a
+    /// field the query did NOT target the `_passage` source. An ordinary
+    /// (non-autoindex) document that happens to carry `name` and `body`
+    /// fields, queried on `name` alone, must get its passage from `name` —
+    /// the contract is "the best window across every text field the query
+    /// targets". The first cut of #1396 injected `body`/`code` whenever it
+    /// met a `name`/`defs` field, so this returned `field: "body"`.
+    #[test]
+    fn lexical_passage_never_uses_a_field_the_query_did_not_target() {
+        let source = json!({
+            "name": "alpha widget",
+            "body": "alpha alpha alpha\nalpha beta alpha\nalpha",
+        });
+        let query = QueryNode::Match {
+            field: "name".into(),
+            query: "alpha".into(),
+            operator: Default::default(),
+            analyzer: None,
+            boost: None,
+            minimum_should_match: None,
+            lenient: false,
+        };
+        let out = apply_lexical_passages(vec![passage_hit("es-doc", source)], &query);
+        let passage = out[0].passage.as_ref().expect("passage filled");
+        assert_eq!(passage.field, "name", "got {passage:?}");
+        assert_eq!(passage.text, "alpha widget");
+
+        // Same shape through multi_match on `name` + `defs`: neither `body`
+        // nor `code` was targeted, so neither may be chosen.
+        let source = json!({
+            "name": "alpha",
+            "defs": "alpha beta",
+            "code": "alpha alpha alpha alpha",
+            "body": "alpha alpha alpha alpha alpha",
+        });
+        let query = QueryNode::MultiMatch {
+            fields: vec!["name^4".into(), "defs^3".into()],
+            query: "alpha".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+            lenient: false,
+        };
+        let out = apply_lexical_passages(vec![passage_hit("es-doc-2", source)], &query);
+        let passage = out[0].passage.as_ref().expect("passage filled");
+        assert!(
+            matches!(passage.field.as_str(), "name" | "defs"),
+            "passage must come from a targeted field, got {passage:?}"
+        );
+    }
+
+    /// #1364: the realistic autoindex per-symbol document (exactly the
+    /// fields `extract/code.rs` emits — no `symbol_count`, which only the
+    /// whole-file document carries) still gets its passage from `code`
+    /// rather than the bare `name`, when `xerj search` targets both.
+    #[test]
+    fn autoindex_symbol_doc_passage_prefers_code_over_name() {
+        let source = json!({
+            "title": "de",
+            "path": "tests/testthat/test-aplicabilidad.R",
+            "language": "r",
+            "name": "de",
+            "kind": "function",
+            "line": 241,
+            "code": "de <- function(col) {\n  trimws(col)\n}",
+        });
+        let query = QueryNode::MultiMatch {
+            fields: vec![
+                "name^4".into(),
+                "defs^3".into(),
+                "code^2".into(),
+                "body".into(),
+                "title".into(),
+            ],
+            query: "de".into(),
+            match_type: Default::default(),
+            operator: None,
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+            lenient: false,
+        };
+        let out = apply_lexical_passages(vec![passage_hit("sym", source)], &query);
+        let passage = out[0].passage.as_ref().expect("passage filled");
+        assert_eq!(passage.field, "code", "got {passage:?}");
     }
 
     /// #174: a document that merely carries a field named `language` (not
@@ -59731,6 +60513,18 @@ mod exact_scan_hydration_tests {
         }
     }
 
+    #[test]
+    fn terms_on_undeclared_strings_keeps_legacy_word_matching() {
+        let query = QueryNode::Terms {
+            field: "text".into(),
+            values: vec![Value::from("brown")],
+            boost: None,
+        };
+        let source = serde_json::json!({ "text": "quick brown fox" });
+
+        assert!(doc_matches_query_typed(&query, &source, &Schema::empty()));
+    }
+
     /// The full-source plan IS the old behaviour: the whole source with `_id`
     /// inserted over whatever the document carried under that key.
     #[test]
@@ -59742,5 +60536,63 @@ mod exact_scan_hydration_tests {
         let doc = serde_json::json!({"_id": "shadowed", "tag": "t"});
         assert!(KnnFilterPlan::FullSource.matches(&filter, "real", &doc, &schema));
         assert!(!KnnFilterPlan::FullSource.matches(&filter, "other", &doc, &schema));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn do_flush_shard_skips_finalize_gate_for_empty_shard() {
+        // #1226 follow-up to #1319. `Index::refresh` / `Index::flush` already
+        // skip shards that look empty when the fan-out is built, but a shard
+        // task spawned for a non-empty shard can find it drained by a
+        // concurrent flush by the time it holds its `flush_sema` permit, and
+        // the ingest-triggered flush paths call `do_flush_shard` directly.
+        // Those calls must not queue on the process-global
+        // `flush_finalize_gate` just to discover there is nothing to drain.
+        //
+        // Exhaust the global gate, then flush an empty shard directly: it
+        // must return at once and still fire `on_drained` (callers use it to
+        // release their `flush_sema` permit). Without the pre-gate check the
+        // call blocks on `acquire()` and the timeout fires. The permits are
+        // held only for the duration of one no-op call, so concurrent tests
+        // that flush are delayed by microseconds, not stalled.
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(&dir);
+        let idx = eng.get_or_create_index("empty-shard-skip").unwrap();
+        idx.abort_background_tasks();
+        assert_eq!(idx.memtable.shard_load(0).0, 0, "precondition: empty shard");
+
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drained_flag = Arc::clone(&drained);
+        let permits_n = crate::pools::sizing().flush_finalize as u32;
+        let held = crate::flush_finalize_gate()
+            .acquire_many(permits_n)
+            .await
+            .unwrap();
+        assert_eq!(crate::flush_finalize_gate().available_permits(), 0);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            do_flush_shard(
+                0,
+                Arc::clone(&idx.store),
+                Arc::clone(&idx.memtable),
+                Arc::clone(&idx.collection_publication),
+                Arc::clone(&idx.registry),
+                idx.data_dir.clone(),
+                HashMap::new(),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                move || drained_flag.store(true, std::sync::atomic::Ordering::SeqCst),
+                idx.publish_warm_caches(),
+                None,
+            ),
+        )
+        .await;
+        drop(held);
+        result
+            .expect("#1226: an empty shard must not wait on flush_finalize_gate")
+            .expect("flushing an empty shard must succeed");
+        assert!(
+            drained.load(std::sync::atomic::Ordering::SeqCst),
+            "on_drained must fire on the empty-shard fast path"
+        );
     }
 }

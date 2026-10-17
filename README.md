@@ -1,5 +1,9 @@
 # XERJ
 
+<a href="https://trendshift.io/repositories/116361?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-116361" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/116361" alt="xerj-org%2Fxerj | Trendshift" width="250" height="55"/></a>
+
+[English](./README.md) | [简体中文](./README.zh-CN.md) | [日本語](./README.ja-JP.md)
+
 [![CI](https://img.shields.io/github/actions/workflow/status/xerj-org/xerj/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/xerj-org/xerj/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/xerj-org/xerj?style=flat-square&label=release)](https://github.com/xerj-org/xerj/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](./LICENSE)
@@ -442,7 +446,7 @@ cargo run --release -p es-yaml-runner -- --dir tests/es-compat-yaml/yaml
 ## Documentation
 
 - [Guides and API reference](https://xerj.org/docs/)
-- [Recipes](https://xerj.org/recipes) for common tasks
+- [Recipes](https://xerj.org/docs/recipes/) for common tasks
 - [Roadmap](./ROADMAP.md): what ships today versus what is coming, verified against the
   release binary. Release-by-release view:
   [milestones](https://github.com/xerj-org/xerj/milestones); live status:

@@ -7,11 +7,236 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `xerj_map` applies index-name globs before its 100-dataset response cap, so
+  unrelated larger datasets cannot hide a matching catalog entry.
+
+## [1.0.0-rc.96] - 2026-10-15
+
+Window since v1.0.0-rc.95: a fix-and-honesty sweep across search tie order,
+dynamic-mapping doc values, autoindex progress and resume reporting, the
+finalize gate, Windows home-directory resolution and `xerj init`, plus two
+dependency security updates. Contributors in this window: Tong-bit-art,
+todie, fjjjuv, redwolf2019, riazrahaman, sebollin, Tyagiquamar, driphtyio and
+mininxd, whelanh and Jarvis636431. Parts of
+this section's wording for the PRs merged before 2026-10-14 are adapted from
+todie's draft release PR #1397, with thanks.
+
+**Corpus Hub v2 is not a feature of this release.** Its code is in the tree
+(PR [#1423](https://github.com/xerj-org/xerj/pull/1423)), but this build has
+no hub signing key compiled in, so no pre-indexed pack can be verified and
+none is downloaded. PR [#1491](https://github.com/xerj-org/xerj/pull/1491)
+makes that explicit on every hub surface: `xerj ask`, `xerj "<question>"`,
+`xerj hub sync` and `xerj hub pull` exit 5 with one plain message instead of a
+catalogue parse error, the MCP hub tools return the same message, `xerj init`
+no longer writes the hub skill or advertises `xerj "<question>"`, and
+`xerj --help` says the command is unavailable in this build. The
+`xerj code` / `xerj corpus` reference-coding path is unchanged and works as
+before.
+
+### Fixed
+
+- **Inferred `text` fields take the ES dynamic-mapping `doc_values: false`
+  default** (PR [#1329](https://github.com/xerj-org/xerj/pull/1329),
+  Tong-bit-art) — an inferred `text` field kept `doc_values: true` while a
+  declared one defaulted to `false`, so at flush the segment wrote a
+  whole-value keyword column and `terms` answered against raw untokenized
+  strings (another instance of the "answers change at flush" class). Inferred
+  `text` now matches declared `text` and ES; `.keyword` sub-fields keep their
+  column. Test follow-ups: PR
+  [#1331](https://github.com/xerj-org/xerj/pull/1331) (`agg_bucket_cap_terms`)
+  and PR [#1356](https://github.com/xerj-org/xerj/pull/1356) (Tong-bit-art,
+  the `graph_expand` fixture declares its `edges` mapping).
+- **`term`/`terms` on a `text` field with `doc_values: true` no longer drop
+  to 0 hits after a flush** (PR
+  [#1489](https://github.com/xerj-org/xerj/pull/1489), Tong-bit-art) — the
+  doc-values term prefilter answered against the whole-value column for
+  analyzed text; it now declines analyzed text and the query takes the full,
+  correct path.
+- **Total tie order (#191) held on two more `term` routes** (issue
+  [#1359](https://github.com/xerj-org/xerj/issues/1359), PR
+  [#1393](https://github.com/xerj-org/xerj/pull/1393), todie) — a `term` on a
+  `text` field without doc values (the post-#1329 default) and a standalone
+  `term` on a `keyword` field across an unflushed memtable plus flushed
+  segments could return pages that were not prefixes of each other. Bounded
+  pages now keep `score DESC, seq_no ASC, _id ASC` across segments.
+- **`xerj autoindex` accepts a whole-file size cap below 1 GB** (issue
+  [#1233](https://github.com/xerj-org/xerj/issues/1233), PR
+  [#1321](https://github.com/xerj-org/xerj/pull/1321)) — new
+  `--max-file-mb` / `--max-file-bytes` beside `--max-file-gb` (default still
+  2 GB); two size flags together are a usage error. Existing indexes resume
+  with the same prepared-records identity.
+- **An aborted autoindex run no longer prints the "searchable" success
+  footer** (PR [#1318](https://github.com/xerj-org/xerj/pull/1318), partial
+  for issue [#1183](https://github.com/xerj-org/xerj/issues/1183), since
+  closed) — the salvage path now says the records are present but coverage is
+  not guaranteed, and points at `xerj corpus index <name> --fresh`.
+- **Finalize progress and old-server detection for corpus resumes** (issue
+  [#1267](https://github.com/xerj-org/xerj/issues/1267), still open) — the
+  catalog read-back walk is its own `finalize-catalog-readback` progress
+  phase with a real denominator instead of a frozen N/N bar (PR
+  [#1320](https://github.com/xerj-org/xerj/pull/1320)), and the client times
+  one verify window before the walk and warns, without aborting, when the
+  server looks older than the client's fast-path generation (PR
+  [#1430](https://github.com/xerj-org/xerj/pull/1430)). The server-side
+  walk cost is not fixed by either; the issue stays open.
+- **`_refresh` / flush skip empty shards before the shared finalize gate**
+  (issue [#1226](https://github.com/xerj-org/xerj/issues/1226)) — PR
+  [#1319](https://github.com/xerj-org/xerj/pull/1319) skips empty shards when
+  building the flush/refresh fan-out; PR
+  [#1456](https://github.com/xerj-org/xerj/pull/1456) (carries todie's
+  #1399) also checks inside `do_flush_shard` before taking the process-wide
+  gate, and resolves concrete index names and aliases in O(1) instead of
+  listing (and computing stats for) every open index. No latency figure is
+  claimed here; each change is pinned by a regression test.
+- **Multi-index ingest against the memory breaker** (issue
+  [#1250](https://github.com/xerj-org/xerj/issues/1250), closed during the
+  window) — the parent breaker watermark is live-tunable through the ES
+  dynamic cluster setting `indices.breaker.total.limit` (a percentage of
+  machine memory or an absolute size), without a restart, and the 429 message
+  names the knob (PR [#1323](https://github.com/xerj-org/xerj/pull/1323)).
+  The autoindex bulk client damps its AIMD oscillation (a 15 s episode
+  cooldown, an ssthresh, a permit per HTTP attempt) and the breaker's drain
+  churn is reduced (PR [#1482](https://github.com/xerj-org/xerj/pull/1482),
+  carries todie's #1400). Per-index admission and a server-side shed signal
+  are not part of this.
+- **Native `/v1/cluster/health` reports the configured topology** (PR
+  [#1316](https://github.com/xerj-org/xerj/pull/1316), partial for issue
+  [#1170](https://github.com/xerj-org/xerj/issues/1170)) — it hardcoded one
+  node; it now agrees with `_cluster/health` and flags a degraded transport.
+  This is the configured floor, not live ring state: the Raft ring is still
+  not wired to the engine and #1170 stays open.
+- **Corpus builder refuses two silent wrong-result paths** (PR
+  [#1315](https://github.com/xerj-org/xerj/pull/1315), partial for issue
+  [#1110](https://github.com/xerj-org/xerj/issues/1110), which stays open) —
+  a missing source root used to prune every stored envelope with exit 0, and
+  records with an empty id shipped together and collapsed to one `_id`. Both
+  now fail loudly. PR [#1500](https://github.com/xerj-org/xerj/pull/1500) (carries
+  todie's #1468) also fails the build on an unreadable or invalid stored
+  envelope and deletes stale shards before writing new ones, and adds a
+  `cisa-kev` pack definition (not published or signed). The fresh-machine
+  portability matrix of #1110 is still open.
+- **Native Windows: home directory falls back to `%USERPROFILE%`** when
+  `HOME` is unset (PR [#1427](https://github.com/xerj-org/xerj/pull/1427)) —
+  `xerj init` skipped every home-scoped agent config and caches resolved
+  relative to the working directory. The shared helper is now used by the
+  MCP server, autoindex, the server and local auth too (PRs
+  [#1436](https://github.com/xerj-org/xerj/pull/1436),
+  [#1437](https://github.com/xerj-org/xerj/pull/1437),
+  [#1438](https://github.com/xerj-org/xerj/pull/1438),
+  [#1439](https://github.com/xerj-org/xerj/pull/1439)).
+- **`xerj init` never edits `.mcp.json` or `AGENTS.md` without a backup**
+  (PR [#1411](https://github.com/xerj-org/xerj/pull/1411)) — a failed backup
+  copy was ignored and an unreadable `AGENTS.md` was replaced; both now leave
+  the file untouched. **Teaching files are version-marked** (PR
+  [#1444](https://github.com/xerj-org/xerj/pull/1444)): a re-run upgrades an
+  unedited older copy (with a `.bak`), keeps an edited one and says so, and
+  treats an unmarked file as the user's.
+- **`xerj code` renders a symbol hit's code, not its provenance digest**
+  (PR [#1431](https://github.com/xerj-org/xerj/pull/1431), carries todie's
+  #1390) — `*-symbols` hits printed the 42-char `ax_file` digest as the
+  passage; `ax_*` keys are now excluded from the fallback, and `code` is used
+  only on symbol-shaped records so a short raw-JSON `code` field (an error
+  code, a CWE id) does not regress.
+- **`xerj autoindex map --prefix` is honoured** (PR
+  [#1459](https://github.com/xerj-org/xerj/pull/1459), carries todie's
+  #1391) — the flag was ignored and every corpus printed; scoping now happens
+  in the server query as well as client-side, and a blank `wall_seconds` no
+  longer renders as `wall s`.
+- **Console bootstrap banner names a recovery that exists** (issue
+  [#1424](https://github.com/xerj-org/xerj/issues/1424), PR
+  [#1426](https://github.com/xerj-org/xerj/pull/1426), Tong-bit-art) — it
+  suggested `xerj admin magic-link`, which the binary rejects; it now says to
+  restart the node, which prints a fresh link before enrolment.
+- **Console: a superseded render never paints over a newer route** (issue
+  [#1425](https://github.com/xerj-org/xerj/issues/1425), PR
+  [#1428](https://github.com/xerj-org/xerj/pull/1428)) — a slow view could
+  snap back over the one the user had moved to; also the root cause of a
+  flaky browser test.
+- **`xerj search` on multi-word natural-language queries** (partial for
+  issue [#1364](https://github.com/xerj-org/xerj/issues/1364), which stays
+  open) — for queries of three or more distinct tokens, short glue words
+  (EN/ES/PT/FR/IT/DE) are dropped from the match clauses so a symbol named
+  `de` no longer wins, and passages on autoindex code documents prefer the
+  `code`/`body` field over a bare name (PR
+  [#1484](https://github.com/xerj-org/xerj/pull/1484), carries todie's
+  #1396).
+- **Whole-file `xerj search` / `xerj def` hits print a 1-based line** (issue
+  [#1365](https://github.com/xerj-org/xerj/issues/1365), PR
+  [#1502](https://github.com/xerj-org/xerj/pull/1502), carries todie's
+  #1392) — the engine also recomputes a refined code passage's start line. A
+  hit whose best passage is a `defs`/`title` field still prints the bare
+  path, a residual left open.
+- **A failed thread spawn degrades instead of aborting the process**
+  (partial for issue [#1122](https://github.com/xerj-org/xerj/issues/1122),
+  which stays open) — under memory exhaustion `std::thread::spawn` panics,
+  and the engine is `panic=abort`. These paths now handle the error: the
+  `xerj share` tunnel fails on its own (PR
+  [#1479](https://github.com/xerj-org/xerj/pull/1479)), an extractor reader
+  thread fails its file rather than the whole run (PR
+  [#1480](https://github.com/xerj-org/xerj/pull/1480)), and autoindex index
+  workers, sync replay and object fetch degrade (PR
+  [#1481](https://github.com/xerj-org/xerj/pull/1481)), and the phase-A scan
+  pool falls back to the calling thread (PR
+  [#1501](https://github.com/xerj-org/xerj/pull/1501)). Spawn sites elsewhere
+  are tracked by the issue.
+- **`xerj` and `xerj index` refuse a missing or non-numeric flag value**
+  (issue [#1435](https://github.com/xerj-org/xerj/issues/1435), PR
+  [#1452](https://github.com/xerj-org/xerj/pull/1452)) — `xerj --data-dir`
+  with no value booted on `./data` and swallowed the next flag; it is now a
+  usage error.
+- **`xerj --help` states the served MCP tool count** (issue
+  [#1443](https://github.com/xerj-org/xerj/issues/1443), PR
+  [#1455](https://github.com/xerj-org/xerj/pull/1455)) — computed from the
+  served tool list instead of a stale constant.
+
+### Added
+
+- **`xerj code --fuse-symbols`, opt-in** (issue
+  [#1237](https://github.com/xerj-org/xerj/issues/1237), PR
+  [#1457](https://github.com/xerj-org/xerj/pull/1457), carries todie's
+  #1401) — autoindex symbol records now carry `end_line` and a searchable
+  `impl` body slice (capped at 16 KiB); with the flag, a second BM25 leg over
+  symbol bodies is fused with the file ranking by Reciprocal Rank Fusion
+  (`k = 60`). Without the flag the default ranking is unchanged.
+  Pre-existing state dirs resume without a rebuild.
+- **`--auto-port`, opt-in** (PR
+  [#1487](https://github.com/xerj-org/xerj/pull/1487), mininxd) — with
+  `--auto-port`, `XERJ_AUTO_PORT=true` or `[server] auto_port = true`, a
+  node whose ports are taken binds the next free ones, and a data dir held by
+  another live node moves to a `<data_dir>-N` sibling, so several agents can
+  start nodes side by side. Off by default: a taken port stays a fatal
+  startup error.
+
+### Performance
+
+- **autoindex indexes the plan once per snapshot** instead of rescanning it
+  for every file (PR [#1483](https://github.com/xerj-org/xerj/pull/1483),
+  carries part of todie's #1394). Also from #1394: read-lease counting moved
+  off writer-hot cache lines and the graveyard lock (PR
+  [#1496](https://github.com/xerj-org/xerj/pull/1496)), and the PDF worker
+  supervisor wakes on pipe EOF instead of a 20 ms sleep poll (PR
+  [#1486](https://github.com/xerj-org/xerj/pull/1486)). No figures are
+  claimed here.
+
+### Security
+
+- **`quinn-proto` 0.11.14 → 0.11.19** (PR
+  [#1357](https://github.com/xerj-org/xerj/pull/1357), Tong-bit-art) —
+  `RUSTSEC-2026-0338` through `-0342`.
+- **`calamine` 0.26.1 → 0.36.1 and `zip` 2 → 8** (issue
+  [#1358](https://github.com/xerj-org/xerj/issues/1358), PR
+  [#1398](https://github.com/xerj-org/xerj/pull/1398), todie) — removes
+  `quick-xml` 0.31.0 (`RUSTSEC-2026-0097`, `-0098`) from the dependency
+  graph. The `.xls` path stays process-isolated as in rc.95.
+
 ### Measured
 
 - **The #1062 wrong-and-confident detection gate was run through the real
   `_watcher` path and it FAILS** (issue
-  [#1108](https://github.com/xerj-org/xerj/issues/1108)) — the unmeasured half
+  [#1108](https://github.com/xerj-org/xerj/issues/1108), PR
+  [#1322](https://github.com/xerj-org/xerj/pull/1322)) — the unmeasured half
   of the rc.80 `_watcher` work. On the rc.94 release binary, a real
   `PUT /_watcher/watch` with `condition.xerj_decide` (one detection watch per
   label, one-vs-rest) evaluated a 120-email boundary tier and wrote 120 fire
@@ -26,6 +251,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   detection watch as a "confidently correct" default, and no doc claims it is.
   Raw results, corpus generator and harness in
   `benchmarks/systemone-watcher-gate/`. Closes #1108.
+
+### Documentation & site
+
+- Docs that named commands which do not exist were corrected: the
+  troubleshooting page's `xerj support-bundle` (issue
+  [#1433](https://github.com/xerj-org/xerj/issues/1433), PR
+  [#1434](https://github.com/xerj-org/xerj/pull/1434)), the upgrades page's
+  `xerj migrate` / `xerj verify` (issue
+  [#1440](https://github.com/xerj-org/xerj/issues/1440), PR
+  [#1451](https://github.com/xerj-org/xerj/pull/1451)), the rerank egress
+  table's `--interval` (issue
+  [#1441](https://github.com/xerj-org/xerj/issues/1441), PR
+  [#1442](https://github.com/xerj-org/xerj/pull/1442)), and the
+  reference-coding opener prompt's removed `xc` scripts (PR
+  [#1450](https://github.com/xerj-org/xerj/pull/1450)); the engine README's
+  License link now resolves (issue
+  [#1445](https://github.com/xerj-org/xerj/issues/1445), PR
+  [#1446](https://github.com/xerj-org/xerj/pull/1446)).
+- `llms.txt` reaches the existing `xerj corpus` / `xerj code` corpus path
+  with commands that work (PR
+  [#1371](https://github.com/xerj-org/xerj/pull/1371)); top-nav HUB, X and
+  Discord links (PR [#1352](https://github.com/xerj-org/xerj/pull/1352));
+  a Simplified Chinese README (PR
+  [#1341](https://github.com/xerj-org/xerj/pull/1341), redwolf2019); the
+  Trendshift badge (PR [#1458](https://github.com/xerj-org/xerj/pull/1458)).
+- Planning documents, not shipped features: the Corpus Hub v2 implementation
+  plan (PR [#1376](https://github.com/xerj-org/xerj/pull/1376)) and its
+  pre-registered proof-of-value measurement (PR
+  [#1385](https://github.com/xerj-org/xerj/pull/1385)); a blog note that the
+  #1138 trajectory corpus gap has been seeded (PR
+  [#1314](https://github.com/xerj-org/xerj/pull/1314), issue
+  [#1138](https://github.com/xerj-org/xerj/issues/1138) stays open).
+
+### Community & field reports
+
+- Field reports: ES-compat flush-parity verification of rc.95 (PR
+  [#1330](https://github.com/xerj-org/xerj/pull/1330), Tong-bit-art), Hermes
+  agent semantic search over an agent kanban board (PR
+  [#1354](https://github.com/xerj-org/xerj/pull/1354), riazrahaman),
+  natural-language search on a Spanish-language R package (PR
+  [#1367](https://github.com/xerj-org/xerj/pull/1367), sebollin),
+  shared-cluster retrieval and an `llms.txt` audit (PR
+  [#1373](https://github.com/xerj-org/xerj/pull/1373), todie), Windows
+  autoindex + MCP (PR [#1420](https://github.com/xerj-org/xerj/pull/1420),
+  fjjjuv), a Hermes agent autoindexing skills and blog corpora (PR
+  [#1492](https://github.com/xerj-org/xerj/pull/1492), driphtyio), and two
+  reference-coding reports, end to end and across the Omarchy-port and
+  Fedora repos (PRs [#1463](https://github.com/xerj-org/xerj/pull/1463),
+  [#1465](https://github.com/xerj-org/xerj/pull/1465), whelanh).
+- CLA signatures: Tyagiquamar (#1327), Tong-bit-art (#1328), redwolf2019
+  (#1342), riazrahaman (#1355), sebollin (#1366), fjjjuv (#1421), todie
+  (#1429), mininxd (#1488), Jarvis636431 (#1499), and leninworld, whelanh,
+  bryanbans, YongxinFu and ChenShuo2004 (#1495). The CLA check no longer deadlocks on a contributor's own
+  self-signature PR (PR [#1432](https://github.com/xerj-org/xerj/pull/1432),
+  carries todie's #1404, with the inputs pinned to the event SHA).
+
+### Housekeeping
+
+- Dead-code and comment cleanups: PRs #1447, #1448, #1449, #1453, #1454.
+- CI and test reliability: PR #1422 (fjjjuv, transport auth tests retry a
+  port bind race); PR #1490 (the fuzz workspace's lockfile is seeded from
+  `engine/Cargo.lock`, because every `zip` 8.x release was yanked upstream
+  and a fresh resolve failed); PR #1494 adds a manual workflow that prints
+  the public half of the hub signing seed. It bakes no key into the binary:
+  `HUB_PUBKEY_HEX` is still empty in rc.96. PR
+  [#1506](https://github.com/xerj-org/xerj/pull/1506) repairs two merge skews
+  that made main red during the cut: the `auto_port` tests (#1487) against
+  #1452's `Result`-returning argument parser, and a comma the #1499 merge
+  dropped from `.contributors`.
+
+<!-- notes-exempt: #1347 (ops: the xerj.org metrics Cloudflare Worker; ships nothing in the binary) -->
+
 ## [1.0.0-rc.95] - 2026-10-12
 
 Window since v1.0.0-rc.94: legacy Microsoft Office support in autoindex,

@@ -953,7 +953,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         follow_symlinks: false,
         follow_symlinks_outside_root: false,
         ignore: crate::ignore_rules::IgnoreOptions::default(),
-        max_file_gb: 1,
+        max_file_bytes: 1 << 30,
         sample: 50,
         no_semantic: !semantic,
         code_analyzer: Default::default(),
@@ -971,6 +971,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         watch: false,
         label: None,
         debounce: std::time::Duration::from_millis(0),
+        exclude_rels: Vec::new(),
     }
 }
 
@@ -4929,10 +4930,35 @@ fn the_generated_path_reports_indexing_as_indexing_not_as_a_stalled_scan() {
             "snapshot",
             "index",
             "finalize-catalog",
+            // #1267: the `run_id`-scoped catalog read-back is its own phase.
+            // On a full-rewrite resume it runs for ~35 min, and used to do so
+            // behind the finished `finalize-catalog` ticker — a line that only
+            // climbed `since_progress_s`, i.e. looked exactly like a hang.
+            "finalize-catalog-readback",
             "finalize-refresh",
             "finalize-verify"
         ],
         "each long step of the generated route is its own phase, in order:\n{stream}"
+    );
+
+    // #1267: that read-back phase opens with the engine's own match total as
+    // its denominator — a moving bar with an ETA from the first page, not a
+    // count with no total. The two-dataset generation writes at least its run
+    // document, so the denominator is non-zero.
+    let readback_opened = lines
+        .iter()
+        .find(|line| line["phase"] == "finalize-catalog-readback")
+        .expect("the catalog read-back walk opens a phase of its own");
+    assert_eq!(readback_opened["basis"], "items", "{readback_opened:?}");
+    let (done, total) = readback_opened["items"].split_once('/').unwrap();
+    assert_eq!(
+        done, "0",
+        "the read-back phase opens at zero: {readback_opened:?}"
+    );
+    assert!(
+        total.parse::<u64>().unwrap() > 0,
+        "the read-back phase opens with the engine's match total, not an unknown \
+         denominator: {readback_opened:?}"
     );
 
     // `scan` never reappears once the run has moved on — the exact symptom.

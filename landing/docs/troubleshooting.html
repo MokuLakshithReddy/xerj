@@ -268,15 +268,15 @@ INFO xerj_cluster::raft: Higher term observed — stepping down to follower</pre
   <p><strong>Fix:</strong> check <code class="inline">GET /_xerj/wal_tap/_stats</code> for gaps and retry backoff, then lower <code class="inline">poll_interval_ms</code> or raise <code class="inline">max_batch_docs</code>. There are no replicas to be stale on a single node — search reads the active memtable plus segments, so local results are always current.</p>
 
   <h2>Getting help</h2>
-  <p>Collect diagnostics before filing a bug. This command builds a self-contained tarball with the config, recent logs, and a metrics snapshot:</p>
-<pre class="code">$ xerj support-bundle --out /tmp/xerj-support-$(date +%s).tar.gz
-wrote /tmp/xerj-support-1745000000.tar.gz (384 KiB)
-contents:
-  config.toml
-  logs/xerj.log.gz
-  metrics.txt
-  cluster-health.json
-  indices-stats.json</pre>
+  <p>Collect diagnostics before filing a bug. There is no single bundle command; these five read what a report needs into one directory you can attach to the issue. Ports and paths are the defaults from the <a href="/docs/operations">production guide</a> — adjust them if your config differs:</p>
+<pre class="code">$ mkdir xerj-report &amp;&amp; cd xerj-report
+$ export XERJ_API_KEY=$(sudo cat /var/lib/xerj/admin.key)
+$ xerj --version &gt; version.txt
+$ curl -s http://127.0.0.1:8080/v1/health &gt; health.json
+$ curl -s -H "Authorization: ApiKey $XERJ_API_KEY" http://127.0.0.1:8080/v1/metrics &gt; metrics.txt
+$ curl -s -H "Authorization: ApiKey $XERJ_API_KEY" http://127.0.0.1:9200/_cluster/health &gt; cluster-health.json
+$ journalctl -u xerj --since "1 hour ago" --no-pager &gt; xerj.log</pre>
+  <p>Leave the config file and <code class="inline">admin.key</code> out of the report — the key is the node's admin credential. Paste the relevant <code class="inline">[section]</code> of the config by hand instead.</p>
 
   <p class="source-note">Source · engine/crates/xerj-server/src/main.rs · engine/crates/xerj-common/src/metrics.rs</p>
   
@@ -288,7 +288,7 @@ contents:
 
   <!-- Print-only branded footer (hidden on screen, visible in PDF) -->
   <div class="print-footer" style="display:none;">
-    <span>XERJ.AI · V1.0.0-RC.95 · 2026-08-11</span>
+    <span>XERJ.AI · V1.0.0-RC.96 · 2026-08-11</span>
     <a href="https://xerj.org/docs/">https://xerj.org/docs/</a>
     <span>Troubleshooting</span>
   </div>
@@ -346,7 +346,7 @@ contents:
 </nav>
 <!-- seo:footer-end -->
 <footer class="footer">
-  <span>XERJ.AI · DOCS · V1.0.0-RC.95</span>
+  <span>XERJ.AI · DOCS · V1.0.0-RC.96</span>
   <span>READ THE SOURCE</span>
   <span><a href="/">HOME</a> · <a href="/product">PRODUCT</a> · <a href="/brand">BRAND</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>

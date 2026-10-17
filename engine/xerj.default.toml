@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 55 of XERJ's 130 user-facing settings to their
+# This file sets 56 of XERJ's 134 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -38,6 +38,14 @@ grpc_port = 8081
 # Port for the Elasticsearch-compatible REST API (ES 8.x wire format).
 # Point existing ES clients, Kibana, or Logstash here.
 es_compat_port = 9200
+
+# Multi-instance opt-in. When true, a taken port makes this node bind the next
+# free one (the banner prints the ports actually bound), and a data_dir held by
+# another live xerj process makes it use "<data_dir>-2", "-3", ... instead.
+# Off by default everywhere: a taken port is a fatal startup error so a client
+# pointed at the configured port can never silently reach another instance.
+# Also: --auto-port / --no-auto-port, or env XERJ_AUTO_PORT=true|false.
+auto_port = false
 
 # Directory where all index data, WAL files, and segments are stored.
 # Ensure this path has sufficient disk space and fast I/O.
@@ -679,5 +687,26 @@ access_log = false
 # text_field     = "text"
 # positive_label = "true"         # the label a noul's probability is the share of
 # min_confidence = 0.0            # /_decide abstains below this
+# escalate_below = 0.8            # escalate tier-1 vote to tier-2 local head below this winning share (0.0 disables; #1094)
 # human_weight   = 2.0            # vote-weight multiplier for history docs carrying human: true
 # calibration    = "none"         # none | isotonic | temperature — p_cal beside every p_raw (#1063)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Corpus Hub — hosted read-only endpoints.
+#
+# Four GET routes under /_hub/v1/ answer from the pre-indexed corpus packs
+# restored on this node: /catalogue, /def/{slug}/{symbol}, /code/{slug} and
+# /search. They are served on the ES-compatible port (es_compat_port), are
+# read-only, only ever query xc-* indices, and are rate limited to 60
+# requests a minute per client address (429 + Retry-After).
+# By default every route needs an API key like the rest of the node.
+# `public = true` lets exactly those four routes answer without one; every
+# other route keeps authentication, authorization and the audit log.
+# `catalogue_path` is the signed catalogue.json the node serves and checks
+# every corpus name against; it is required when `public = true`, or the
+# node refuses to start. Behind a reverse proxy, also list the proxy in
+# [server] trusted_proxies, or every client shares the proxy's one budget.
+#
+# [hub]
+# public         = false
+# catalogue_path = ""    # not a default ("/srv/hub/catalogue.json") — required when public = true

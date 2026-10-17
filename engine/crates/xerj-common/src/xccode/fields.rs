@@ -57,11 +57,17 @@ pub fn resolve_fields(mapping: Option<&Value>) -> Vec<String> {
             }
         }
     }
+    // A field any index maps as numeric cannot ride the wildcard
+    // `multi_match`: the engine rejects the whole query with
+    // `For input string: "<query>"` (#1284). One long `title` among 132
+    // indices is enough. Keyword stays — that is the measured code-corpus
+    // list, and a keyword is not this rejection.
+    let numeric = numeric_fields(obj);
     let mut out: Vec<String> = FIELDS
         .iter()
         .filter(|f| {
             let base = f.split('^').next().unwrap_or(f);
-            present.contains(base)
+            present.contains(base) && !numeric.contains(base)
         })
         .map(|s| s.to_string())
         .collect();
@@ -79,7 +85,7 @@ pub fn resolve_fields(mapping: Option<&Value>) -> Vec<String> {
     // code-family hit and took the whole top-10; at ^0.5 the family stays
     // searchable (same 39 total hits) while the needle docs keep their
     // code-family scores.
-    if present.contains("text") {
+    if present.contains("text") && !numeric.contains("text") {
         out.push("text^0.5".to_string());
     }
     // #1244 coverage gate: an own field joins the ^0.5 union only when at
@@ -118,7 +124,7 @@ pub fn resolve_fields(mapping: Option<&Value>) -> Vec<String> {
     // That also ends the alphabetical-cap failure the #1244 gate was
     // partly compensating for ($comment kept, Summary cut).
     let min_union_indices = obj.len().div_ceil(4);
-    let own_gated = own_recall_legs(obj, min_union_indices);
+    let own_gated = own_recall_legs(obj, min_union_indices, &numeric);
     if out.is_empty() {
         // #1158: a raw-JSON corpus (ghsa-db's advisory mirrors, OSV) maps
         // NONE of the standard content fields — every record carries its
@@ -136,10 +142,17 @@ pub fn resolve_fields(mapping: Option<&Value>) -> Vec<String> {
         // raw-JSON corpus whose shards each map different prose fields is
         // better served by its 10%-coverage fields than by a guaranteed-
         // wrong `body`.
-        let mut own_any = own_text_fields(obj, 1);
+        let mut own_any = own_text_fields(obj, 1, &numeric);
         own_any.truncate(MAX_OWN_FIELDS);
         if own_any.is_empty() {
-            vec!["body".to_string()]
+            // `body` is the historical floor for a mapping that names no
+            // text field. It is not a floor when some index maps `body` as
+            // numeric: sending it is the #1284 rejection, not a silent zero.
+            if numeric.contains("body") {
+                Vec::new()
+            } else {
+                vec!["body".to_string()]
+            }
         } else {
             own_any
         }
@@ -173,6 +186,45 @@ pub fn resolve_fields(mapping: Option<&Value>) -> Vec<String> {
 /// ride the query.
 const MAX_OWN_FIELDS: usize = 24;
 
+/// Types the engine stores as `long` or `double` (`es_type_to_field_type` in
+/// `xerj-engine`). A `multi_match` naming one of these fails the index with
+/// `For input string: "<query>"` (#1284), and a wildcard fails every index
+/// with it.
+fn is_numeric_mapping_type(t: &str) -> bool {
+    matches!(
+        t,
+        "long"
+            | "integer"
+            | "short"
+            | "byte"
+            | "unsigned_long"
+            | "double"
+            | "float"
+            | "half_float"
+            | "scaled_float"
+    )
+}
+
+/// Field names any index in the union maps as numeric.
+fn numeric_fields(obj: &serde_json::Map<String, Value>) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for m in obj.values() {
+        let Some(props) = m.pointer("/mappings/properties").and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, spec) in props {
+            if spec
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_numeric_mapping_type)
+            {
+                out.insert(key.clone());
+            }
+        }
+    }
+    out
+}
+
 /// The corpus's own searchable content fields: every property mapped `text`
 /// (or `semantic_text`) by at least `min_indices` of the indices in the
 /// union, `ax_*` provenance excluded, names sorted, uncapped (callers cap —
@@ -180,7 +232,11 @@ const MAX_OWN_FIELDS: usize = 24;
 /// `1` (any mapping index — the alternative is a guaranteed-wrong `body`),
 /// the #1244 union passes a quarter of the union (see the coverage note in
 /// [`resolve_fields`]).
-fn own_text_fields(obj: &serde_json::Map<String, Value>, min_indices: usize) -> Vec<String> {
+fn own_text_fields(
+    obj: &serde_json::Map<String, Value>,
+    min_indices: usize,
+    numeric: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
     const AX: &str = "ax_";
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for m in obj.values() {
@@ -192,7 +248,10 @@ fn own_text_fields(obj: &serde_json::Map<String, Value>, min_indices: usize) -> 
                 .get("type")
                 .and_then(Value::as_str)
                 .is_some_and(|t| t == "text" || t == "semantic_text");
-            if searchable && !key.starts_with(AX) {
+            // #1237: `impl` is the symbol-record implementation field queried
+            // by its own dedicated BM25 leg under `--fuse-symbols`; never fold
+            // it into the file-level `multi_match` over `body`/`defs`/`title`.
+            if searchable && !key.starts_with(AX) && key != "impl" && !numeric.contains(key) {
                 *counts.entry(key.clone()).or_insert(0) += 1;
             }
         }
@@ -221,7 +280,11 @@ fn own_text_fields(obj: &serde_json::Map<String, Value>, min_indices: usize) -> 
 /// lowest counts and sorts behind every widely-mapped field; the
 /// alphabetical-cap failure this replaces kept a literal `$comment` and
 /// cut `Summary` on exploit-pocs-2026.
-fn own_recall_legs(obj: &serde_json::Map<String, Value>, min_union_indices: usize) -> Vec<String> {
+fn own_recall_legs(
+    obj: &serde_json::Map<String, Value>,
+    min_union_indices: usize,
+    numeric: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
     const STANDARD: [&str; 4] = ["body", "defs", "title", "defs_expanded"];
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut family: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -233,6 +296,8 @@ fn own_recall_legs(obj: &serde_json::Map<String, Value>, min_union_indices: usiz
             .iter()
             .filter(|(key, spec)| {
                 !key.starts_with("ax_")
+                    && *key != "impl"
+                    && !numeric.contains(*key)
                     && spec
                         .get("type")
                         .and_then(Value::as_str)
@@ -264,6 +329,19 @@ fn own_recall_legs(obj: &serde_json::Map<String, Value>, min_union_indices: usiz
         .collect()
 }
 
+/// Whether at least one index under the prefix maps the symbol-record `impl`
+/// field (#1237) as searchable text (`text` or `semantic_text`).
+pub fn has_symbol_impl(mapping: Option<&Value>) -> bool {
+    let Some(mapping) = mapping.and_then(Value::as_object) else {
+        return false;
+    };
+    mapping.values().any(|m| {
+        m.pointer("/mappings/properties/impl/type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "text" || t == "semantic_text")
+    })
+}
+
 /// Indices under the prefix whose `field` (default `body`) is mapped as
 /// `semantic_text`.
 ///
@@ -289,6 +367,72 @@ pub fn semantic_capable(mapping: Option<&Value>) -> (Vec<String>, usize) {
         .collect();
     capable.sort();
     (capable, mapping.len())
+}
+
+/// One semantic field per index, then indices grouped by that field.
+///
+/// Preference is `body`, then `text`, then the alphabetically first
+/// `semantic_text` property. Code indices often elect `code` (or prose
+/// elects `text`) while a document dataset elects `body`; a query that only
+/// names `body` never reaches the others, and posting `body` at an index
+/// that maps it as plain `text` 400s the whole request.
+///
+/// Groups are ordered `body`, `text`, then the remaining field names.
+/// Index names inside a group are sorted. An unreadable mapping is empty.
+pub fn semantic_groups(mapping: Option<&Value>) -> (Vec<(String, Vec<String>)>, usize) {
+    let Some(mapping) = mapping.and_then(Value::as_object) else {
+        return (Vec::new(), 0);
+    };
+    let mut by_field: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (name, body) in mapping {
+        let Some(chosen) = elected_semantic_field(body) else {
+            continue;
+        };
+        by_field.entry(chosen).or_default().push(name.clone());
+    }
+    let mut groups: Vec<(String, Vec<String>)> = by_field.into_iter().collect();
+    for (_, indices) in &mut groups {
+        indices.sort();
+    }
+    groups.sort_by(|left, right| {
+        semantic_field_rank(&left.0)
+            .cmp(&semantic_field_rank(&right.0))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    (groups, mapping.len())
+}
+
+fn semantic_field_rank(field: &str) -> u8 {
+    match field {
+        "body" => 0,
+        "text" => 1,
+        _ => 2,
+    }
+}
+
+fn elected_semantic_field(mapping_body: &Value) -> Option<String> {
+    let props = mapping_body
+        .pointer("/mappings/properties")
+        .and_then(Value::as_object)?;
+    let mut semantic: Vec<&str> = props
+        .iter()
+        .filter(|(_, spec)| {
+            spec.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|ty| ty == "semantic_text")
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if semantic.is_empty() {
+        return None;
+    }
+    semantic.sort_unstable();
+    let chosen = ["body", "text"]
+        .into_iter()
+        .find(|preferred| semantic.contains(preferred))
+        .unwrap_or(semantic[0]);
+    Some(chosen.to_string())
 }
 
 #[cfg(test)]
@@ -379,6 +523,48 @@ mod tests {
         assert_eq!(capable, vec!["sem-1".to_string(), "sem-2".to_string()]);
         assert_eq!(total, 3);
         assert!(semantic_capable(None) == (Vec::new(), 0));
+    }
+
+    /// A code index that elects `code` (not `body`) and a prose index that
+    /// elects `text` must both be queried, on their own field. `body` wins
+    /// when an index maps both.
+    #[test]
+    fn semantic_groups_follow_the_field_each_index_actually_embeds() {
+        let m = json!({
+            "manifest": { "mappings": { "properties": {
+                "body": { "type": "semantic_text" },
+                "text": { "type": "text" }
+            }}},
+            "code": { "mappings": { "properties": {
+                "body": { "type": "text" },
+                "code": { "type": "semantic_text" }
+            }}},
+            "prose": { "mappings": { "properties": {
+                "text": { "type": "semantic_text" },
+                "title": { "type": "text" }
+            }}},
+            "both": { "mappings": { "properties": {
+                "body": { "type": "semantic_text" },
+                "text": { "type": "semantic_text" }
+            }}},
+            "plain": { "mappings": { "properties": {
+                "body": { "type": "text" }
+            }}}
+        });
+        let (groups, total) = semantic_groups(Some(&m));
+        assert_eq!(total, 5);
+        assert_eq!(
+            groups,
+            vec![
+                (
+                    "body".to_string(),
+                    vec!["both".to_string(), "manifest".to_string()]
+                ),
+                ("text".to_string(), vec!["prose".to_string()]),
+                ("code".to_string(), vec!["code".to_string()]),
+            ]
+        );
+        assert!(semantic_groups(None).0.is_empty());
     }
 
     /// #1158: a raw-JSON corpus (ghsa-db advisories) maps none of the
@@ -692,5 +878,94 @@ mod tests {
         assert!(got.contains(&"a01^0.5".to_string()) && got.contains(&"a22^0.5".to_string()));
         assert_eq!(got.first().unwrap(), "body");
         assert_eq!(got.len(), 1 + 24 - 1); // body full-weight + 23 own legs
+    }
+
+    #[test]
+    fn symbol_impl_is_detected_and_excluded_from_file_leg_fields() {
+        let m = mapping(&[("xc-code-000", &["body", "defs", "title", "impl"], false)]);
+        assert!(has_symbol_impl(Some(&m)));
+        assert_eq!(
+            resolve_fields(Some(&m)),
+            vec!["body".to_string(), "defs".into(), "title".into()],
+            "impl is queried by its own BM25 leg under --fuse-symbols, never folded into file multi_match"
+        );
+        let no_impl = mapping(&[("xc-code-000", &["body", "defs", "title"], false)]);
+        assert!(!has_symbol_impl(Some(&no_impl)));
+    }
+
+    /// A keyword `title` is the measured code-corpus list. Dropping it would
+    /// move BM25. Only a numeric mapping is poison.
+    #[test]
+    fn keyword_title_stays_in_the_measured_field_list() {
+        let m = json!({ "i": { "mappings": { "properties": {
+            "body": { "type": "text" },
+            "defs": { "type": "text" },
+            "title": { "type": "keyword" }
+        } } } });
+        assert_eq!(
+            resolve_fields(Some(&m)),
+            vec!["body".to_string(), "defs".into(), "title".into()]
+        );
+    }
+
+    /// One index mapping `title` as `long` makes a wildcard `multi_match` on
+    /// `title` fail every index with `For input string: "<query>"` (#1284).
+    /// The qabot-review field report (2026-10-16) was this shape: `xerj code`
+    /// exited 2 on a 132-index corpus whose hand-written `body`/`defs` query
+    /// returned hits. `title` leaves the list; `body` and `defs` stay.
+    #[test]
+    fn a_numeric_title_on_any_index_is_omitted_from_the_union_query() {
+        let m = json!({
+            "code": { "mappings": { "properties": {
+                "body": { "type": "text" },
+                "defs": { "type": "text" },
+                "title": { "type": "text" }
+            } } },
+            "stats": { "mappings": { "properties": {
+                "body": { "type": "text" },
+                "title": { "type": "long" }
+            } } }
+        });
+        let fields = resolve_fields(Some(&m));
+        assert!(fields.iter().any(|f| f == "body"), "{fields:?}");
+        assert!(fields.iter().any(|f| f == "defs"), "{fields:?}");
+        assert!(
+            !fields.iter().any(|f| f.split('^').next() == Some("title")),
+            "{fields:?}"
+        );
+    }
+
+    /// An own field that is text on one index and `integer` on another is
+    /// the same rejection. It must not take a slot in the 24-leg cap.
+    #[test]
+    fn an_own_field_numeric_on_any_index_is_not_a_recall_leg() {
+        let m = json!({
+            "prose": { "mappings": { "properties": {
+                "body": { "type": "text" },
+                "summary": { "type": "text" }
+            } } },
+            "counts": { "mappings": { "properties": {
+                "body": { "type": "text" },
+                "summary": { "type": "integer" }
+            } } }
+        });
+        let fields = resolve_fields(Some(&m));
+        assert!(
+            !fields
+                .iter()
+                .any(|f| f.split('^').next() == Some("summary")),
+            "{fields:?}"
+        );
+        assert!(fields.iter().any(|f| f == "body"), "{fields:?}");
+    }
+
+    /// When `body` itself is numeric and nothing else is text, the historical
+    /// `["body"]` floor would be the rejection. Empty means "do not send".
+    #[test]
+    fn a_numeric_body_and_nothing_else_does_not_fall_back_to_body() {
+        let m = json!({ "i": { "mappings": { "properties": {
+            "body": { "type": "double" }
+        } } } });
+        assert!(resolve_fields(Some(&m)).is_empty());
     }
 }

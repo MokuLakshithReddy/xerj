@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **130 settings** versus
+//! Configuration is intentionally minimal: **134 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -99,12 +99,16 @@ pub struct Config {
     /// Second-stage reranking provider — 3 settings. Inert until a key is set.
     pub rerank: RerankProviderConfig,
     /// Typed decisions answered from a labelled-history index by
-    /// nearest-neighbour vote — 8 settings. Inert until `decisions.index`
+    /// nearest-neighbour vote — 9 settings. Inert until `decisions.index`
     /// names an index that exists.
     pub decisions: DecisionsConfig,
+    /// Corpus Hub hosted read-only endpoints (`/_hub/v1/…`) — 2 settings.
+    /// Inert until `hub.catalogue_path` names a catalogue file; the routes
+    /// need an API key unless `hub.public` is switched on.
+    pub hub: HubConfig,
 }
 
-// 23 sub-configs, 130 leaf settings in total. Do not maintain that sum by hand
+// 24 sub-configs, 134 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -233,6 +237,17 @@ impl Config {
         // echoed by `GET /_xerj/rerank`. Same two rules as the WAL tap target.
         if let Err(reason) = RerankProviderConfig::check_endpoint(&self.rerank.endpoint) {
             return Err(XerjError::config(reason));
+        }
+
+        // Hub: a public node validates every corpus name against the
+        // catalogue, so a public node with no catalogue answers 404 to
+        // everything while appearing to be up. Refuse that at boot.
+        if self.hub.public && self.hub.catalogue_path.trim().is_empty() {
+            return Err(XerjError::config(
+                "hub.public = true requires hub.catalogue_path: the public routes validate \
+                 every corpus name against the catalogue, and with none every request \
+                 would be a 404",
+            ));
         }
 
         // Compression: block_size_docs is documented as 16–4096 and was
@@ -373,6 +388,19 @@ impl Config {
                  vote weight of history documents carrying human: true, and 1.0 disables the \
                  boost",
                 self.decisions.human_weight
+            )));
+        }
+
+        // Decisions: escalate_below is a winning-vote-share floor in 0.0..=1.0
+        // (0.0 disables confidence escalation; #1094).
+        if !self.decisions.escalate_below.is_finite()
+            || !(0.0..=1.0).contains(&self.decisions.escalate_below)
+        {
+            return Err(XerjError::config(format!(
+                "decisions.escalate_below must be in 0.0..=1.0 (got {}); it is the winning \
+                 vote-share floor below which tier 1 escalates to the local decision tier, and \
+                 0.0 disables confidence escalation",
+                self.decisions.escalate_below
             )));
         }
 
@@ -535,13 +563,13 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (130 user-facing settings total; counted by
+// Sub-configs  (134 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Network and data-directory settings.
 ///
-/// **7 settings.**
+/// **8 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -603,6 +631,12 @@ pub struct ServerConfig {
     /// right-most address that is *not* itself a listed proxy is used — the
     /// left end of the chain is written by the caller and cannot be trusted.
     pub trusted_proxies: Vec<String>,
+    /// Multi-instance opt-in (default `false`). When `true`, a listener port
+    /// that is already in use makes the node bind the next free one, and a
+    /// `data_dir` held by another live process makes it use `<data_dir>-N`.
+    /// Off by default so a taken port stays a fatal startup error (#465).
+    #[serde(default)]
+    pub auto_port: bool,
 }
 
 impl Default for ServerConfig {
@@ -618,6 +652,7 @@ impl Default for ServerConfig {
             bind_address: "127.0.0.1".into(),
             allow_insecure_network_bind: false,
             trusted_proxies: Vec::new(),
+            auto_port: false,
         }
     }
 }
@@ -1514,23 +1549,33 @@ impl LogsConfig {
 
 /// Embedding backend settings.
 ///
-/// XERJ can embed `semantic_text` fields three ways, chosen by [`mode`]:
+/// XERJ can embed `semantic_text` fields four ways, chosen by
+/// [`mode`](Self::mode):
 ///   * `"lexical"` — the zero-dependency built-in feature-hash embedder
 ///     (deterministic, 384-dim, no model, no network). This is the honest
 ///     default: lexical, *not* neural semantic understanding.
 ///   * `"neural"` — a built-in BERT sentence embedder (all-MiniLM-L6-v2 by
 ///     default) that runs in-process via `candle`. The model weights are
-///     downloaded once on first use (or read from [`local_model_dir`] for
+///     downloaded once on first use (or read from
+///     [`local_model_dir`](Self::local_model_dir) for
 ///     air-gapped deployments). The neural backend ships in the standard
 ///     binary; a `--no-default-features` slim build omits it and falls back
 ///     to lexical.
 ///   * `"proxy"` — call an external OpenAI-compatible `/v1/embeddings`
-///     endpoint ([`default_endpoint`]). Lets customers plug in ANY embedding
-///     model / provider they already run. An explicit `mode = "proxy"` with a
+///     endpoint ([`default_endpoint`](Self::default_endpoint)). Lets
+///     customers plug in ANY embedding model / provider they already run. An explicit `mode = "proxy"` with a
 ///     missing or unusable endpoint is a startup ERROR (#1189): silently
 ///     running lexical instead would write the wrong vectors into the index
 ///     while every embedding request appears to succeed.
-///   * `"auto"` (default) — use the proxy when [`default_endpoint`] is set,
+///   * `"onnx-experimental"` — a local FP32 ONNX model and tokenizer
+///     ([`onnx_model_path`](Self::onnx_model_path),
+///     [`onnx_tokenizer_path`](Self::onnx_tokenizer_path)) run through ONNX
+///     Runtime; never auto-downloaded. Needs a build with the
+///     `onnx-experimental` feature and is fail-closed: a build without it, or
+///     a missing model or tokenizer, is a startup error, never a lexical
+///     fallback.
+///   * `"auto"` (default) — use the proxy when
+///     [`default_endpoint`](Self::default_endpoint) is set,
 ///     otherwise lexical; if the endpoint fails to initialize, fall back to
 ///     lexical with a warning. The fallback exists ONLY on this path (#1189).
 ///
@@ -1538,8 +1583,9 @@ impl LogsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
-    /// Backend selector: `"auto"` (default), `"lexical"`, `"neural"`, or
-    /// `"proxy"`. Unknown values are treated as `"auto"`.
+    /// Backend selector: `"auto"` (default), `"lexical"`, `"neural"`,
+    /// `"proxy"`, or `"onnx-experimental"`. Unknown values are treated as
+    /// `"auto"`.
     pub mode: String,
     /// OpenAI-compatible endpoint URL (default: `""` — disabled).
     pub default_endpoint: String,
@@ -2636,7 +2682,7 @@ impl RerankProviderConfig {
 /// weighted nearest-neighbour vote over a labelled-history index — the
 /// retrieval analogue of a judge model, with the evidence staying on the node.
 ///
-/// **8 settings.**
+/// **9 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DecisionsConfig {
@@ -2657,6 +2703,13 @@ pub struct DecisionsConfig {
     /// `/_decide` abstains below this vote share (0 = never abstain; the
     /// `/v1/systemone` wire has no abstain field and errors instead).
     pub min_confidence: f64,
+    /// Winning vote-share floor in `0.0..=1.0` below which a tier-1 history
+    /// vote escalates to the tier-2 local decision head when armed
+    /// (`XERJ_DECIDE_MODE=local`, issue #1094). Default `0.8` matches the
+    /// flywheel gate's confidence bar so low-confidence history hits do not
+    /// freeze write-back; `0.0` disables confidence escalation. With no local
+    /// tier armed, a vote below this floor still answers from history.
+    pub escalate_below: f64,
     /// How much more a human correction weighs in the vote than a cached or
     /// seeded example, when the history document carries `human: true`
     /// (issue #1061). 2.0 — the issue's ≥ 2x floor for corrections — is the
@@ -2679,11 +2732,43 @@ impl Default for DecisionsConfig {
             text_field: "text".to_string(),
             positive_label: "true".to_string(),
             min_confidence: 0.0,
+            escalate_below: 0.8,
             human_weight: 2.0,
             calibration: CalibrationMethod::None,
         }
     }
 }
+
+/// Corpus Hub hosted endpoints: four read-only `GET` routes under
+/// `/_hub/v1/` that answer from the pre-indexed packs restored on this node
+/// (`catalogue`, `def/{slug}/{symbol}`, `code/{slug}`, `search`). They are
+/// served on the Elasticsearch-compatible listener (`server.es_compat_port`),
+/// next to `/_memory`, not on the native one.
+///
+/// **2 settings.**
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HubConfig {
+    /// Let those four routes — and nothing else — answer without an API key
+    /// (default: `false`, every route needs a key).
+    ///
+    /// With `true`, `GET /_hub/v1/catalogue`, `/_hub/v1/def/{slug}/{symbol}`,
+    /// `/_hub/v1/code/{slug}` and `/_hub/v1/search` skip authentication,
+    /// authorization and the audit log. Every other route on the node keeps
+    /// all three. The four routes are read-only, only ever query `xc-*`
+    /// indices, and are rate-limited to 60 requests a minute per client
+    /// address (`429` with `Retry-After`). Behind a reverse proxy, list the
+    /// proxy in `server.trusted_proxies`; without it every client shares the
+    /// proxy's address and therefore one 60-a-minute budget.
+    pub public: bool,
+    /// Path to the signed `catalogue.json` this node serves at
+    /// `GET /_hub/v1/catalogue` and validates every corpus name against
+    /// (default: `""` — none). A corpus name that is not in the file is a
+    /// `404`. Required when `public = true`. Prefer an absolute path: a
+    /// relative one resolves against the server's working directory.
+    pub catalogue_path: String,
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2710,6 +2795,35 @@ mod tests {
         // and not judged.
         assert!(RerankProviderConfig::check_resolved_endpoint(good, Some(bad)).is_ok());
         assert!(RerankProviderConfig::check_resolved_endpoint(bad, Some(good)).is_err());
+    }
+
+    /// `[hub]` is closed and fail-closed: a typo is a boot error, the
+    /// defaults leave every route behind the API key, and a public node with
+    /// no catalogue is refused rather than left answering 404 to everything.
+    #[test]
+    fn hub_section_defaults_closed_and_public_requires_a_catalogue() {
+        let d = Config::default();
+        assert!(!d.hub.public, "the hosted routes are keyed by default");
+        assert!(d.hub.catalogue_path.is_empty());
+
+        let ok = Config::from_toml_str(
+            "[hub]\npublic = true\ncatalogue_path = \"/srv/hub/catalogue.json\"\n",
+        )
+        .expect("a public node with a catalogue is valid");
+        assert!(ok.hub.public);
+        assert_eq!(ok.hub.catalogue_path, "/srv/hub/catalogue.json");
+
+        let err = Config::from_toml_str("[hub]\npublic = true\n")
+            .expect_err("public without a catalogue must be refused at boot");
+        assert!(
+            err.to_string().contains("hub.catalogue_path"),
+            "the error names the setting to set: {err}"
+        );
+        // A private node needs no catalogue to boot.
+        Config::from_toml_str("[hub]\npublic = false\n").expect("private, no catalogue");
+
+        // Closed: a misspelt key is an error, not a silently ignored line.
+        assert!(Config::from_toml_str("[hub]\npubic = true\n").is_err());
     }
 
     #[test]
@@ -3577,7 +3691,7 @@ mod tests {
     /// module header, in `xerj-common/src/lib.rs`, in `engine/README.md` and in
     /// `xerj.default.toml`) — change the table and the prose together.
     const SETTINGS_BY_SECTION: &[(&str, usize)] = &[
-        ("server", 7),
+        ("server", 8),
         ("auth", 3),
         ("cors", 2),
         ("tls", 4),
@@ -3599,7 +3713,8 @@ mod tests {
         ("lifecycle", 1),
         ("wal_tap", 10),
         ("rerank", 3),
-        ("decisions", 8),
+        ("decisions", 9),
+        ("hub", 2),
     ];
 
     /// Count the settings by *counting them*.
@@ -3642,7 +3757,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 130,
+            total, 134,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \

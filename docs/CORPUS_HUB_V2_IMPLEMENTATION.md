@@ -639,3 +639,87 @@ Do not:
 - renumber proto fields, change `format_version` semantics, or add a second JSON
   parser for the registry manifest;
 - publish benchmark numbers unless the step-10 condition holds.
+
+## 12. Release gate: backfill, binaries only, end-to-end
+
+Steps 1–11 describe how one pack is built and used. This section defines what must
+be true before a release advertises Hub v2 (`xerj ask`, `xerj "<question>"`, the MCP
+hub tools, the hub pages' one line). Until every item below holds, a release ships
+the hub code switched off and says nothing about it.
+
+**Prerequisite: the key.** `HUB_PUBKEY_HEX` holds the public half of the
+`HUB_SIGNING_SEED` secret, and the `hub key and secret in place?` job in
+`hub-packs.yml` passes. Without it nothing below can run.
+
+**Who routes a question to a corpus: the client.** `xerj_hub::router` runs inside the
+user's `xerj` binary. It routes from the project's lockfiles and from the per-corpus
+term sketches in the signed `catalogue.json`. That file is static, so hub.xerj.org can
+stay a static site, and routing works with no hub server. The hosted search and answer
+routes (step 6) need a live public node, which does not exist. For this release,
+hosted is OUT of scope: the client must work, and the gate is passed, with hosted
+unreachable. A static host answers unknown paths with the HTML home page and status
+200 (today `/api/v1/catalogue.json` and `/api/v1/search` both do), so the client must
+treat a non-JSON or unsigned response as "unavailable", never as data.
+
+**12.1 Backfill: every existing corpus becomes a pre-indexed pack.**
+- Run `hub-packs.yml` (`workflow_dispatch`, `corpora: all`) in capped batches until
+  every live corpus in `backlog/backlog-100.json` has a release for its current pin.
+  "No release for the current pin" already covers the first run, so the backfill
+  needs no new code.
+- A corpus whose licence class is `Excluded` gets no pack and leaves the catalogue.
+- A corpus whose build fails is listed with its error in the backfill report
+  (`benchmarks/hub-backfill/REPORT.md`: slug, pin8, bytes, defs, result) and is fixed or
+  delisted on purpose. Never let it disappear silently.
+- The two record packs from `pack-publish.yml` (`rust-vulns` and
+  `agent-session-trajectories`, signed JSON record archives) are rebuilt as hubpacks
+  (`format_version: 1`, snapshot layout) under the same pipeline and key.
+
+**12.2 Binaries only.** Users get pre-indexed packs, never data to index themselves.
+- Hosted downloads are the signed `.hubpack.tar.zst` + `.sig` release assets. The
+  only JSON served is the signed `catalogue.json` (+ `.sig`), which is the index of
+  the packs and not corpus data.
+- The hub pages and `llms.txt` stop linking per-corpus manifest JSON and stop
+  printing `xerj corpus add --from <url>`. The registry manifests stay in the repo as
+  build inputs for `build-pack` (step 2), and are not a consumer path.
+- The JSON record-pack releases (`pack-rust-vulns-*`, `pack-agent-session-trajectories-*`)
+  are retired once their hubpacks verify, and `pack-publish.yml` stops publishing
+  them. `xerj corpus add --from <url>` keeps working for anyone's own manifests, but
+  the hub no longer points to it.
+
+**12.3 End-to-end, per pack (a CI gate in `hub-packs.yml`).** Each pack job, after
+`Verify the signature and the layout` and BEFORE `Publish the draft`, runs the
+consumer path with the real binary:
+1. A fresh node with an empty data dir and an empty `HOME`.
+2. `xerj hub pull <slug>` from the draft release URL, verified against the embedded key.
+3. `xerj code <slug> --def <symbol> --json`, for one symbol taken from the pack's own
+   `defs.jsonl`, must return that definition with `answered_from: local pack`.
+4. `xerj code <slug> "<a word from ask_for>" --json` must return at least one hit
+   with `file:line`.
+5. Any failure leaves the release a draft and fails the job. A pack that has not
+   passed this is never published.
+
+**12.4 End-to-end, whole hub (the release gate).** Before tagging the release that
+advertises v2, run from a clean machine (the sandbox recipe in
+`benchmarks/hub-pov/sandbox.sh`; empty `HOME`; the release-candidate binary;
+production `hub.xerj.org`):
+- The catalogue loads and verifies, and its corpus count equals the number of
+  published packs.
+- For EVERY catalogued corpus, `xerj hub pull` + one `--def` + one question pass
+  (12.3 again, against the published assets and not the drafts). Results go into the
+  backfill report. The gate is 100% of catalogued corpora; a failing corpus is
+  delisted before the release, not shipped broken.
+- `xerj "<question>"` with no corpus named routes and answers for the lz4 benchmark
+  questions (step 2's "done when") and for `curl https://hub.xerj.org/api/v1/def/lz4/LZ4_VERSION_RELEASE`
+  (step 6's).
+- Hosted off, hosted unreachable (including an HTML 200 from the static site),
+  offline (`--offline`) and over-the-cap (`AUTO_PULL_MAX_BYTES`) paths each give
+  their documented message. The `curl …/api/v1/def/…` check above applies only once a
+  public node exists.
+- The shell-less persona of the first-time-agent harness answers through
+  `xerj_hub_ask` in one call (step 9).
+- A tampered pack (one flipped byte) and a tampered catalogue are refused, with nothing
+  extracted.
+
+Only after 12.1–12.4 pass do the held agent-surface PRs merge and the release notes
+mention Hub v2. Step 10's measurement is separate and still governs any published
+performance claim.

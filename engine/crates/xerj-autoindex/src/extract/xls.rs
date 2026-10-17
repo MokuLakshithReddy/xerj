@@ -358,7 +358,26 @@ fn run_worker(
     let stdout = child.stdout.take().expect("piped stdout");
     // Read on a thread so the wall-clock watchdog below can act even if the
     // worker stalls with the pipe open.
-    let reader = std::thread::spawn(move || read_capped(stdout, MAX_WORKER_OUTPUT));
+    //
+    // #1122: `std::thread::spawn` panics when a thread cannot be created and
+    // release builds are panic=abort; a failed spawn stops the worker and
+    // fails this one file instead of aborting the run.
+    let reader = match std::thread::Builder::new()
+        .name("xerj-xls-stdout".into())
+        .spawn(move || read_capped(stdout, MAX_WORKER_OUTPUT))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            kill_group(pid);
+            let _ = child.wait();
+            return Err(error).with_context(|| {
+                format!(
+                    "could not start the .xls reader's output thread for {}",
+                    path.display()
+                )
+            });
+        }
+    };
 
     let started = std::time::Instant::now();
     let status = loop {

@@ -766,8 +766,8 @@ fn run_id_in_second(second: &str) -> String {
 }
 
 pub fn default_state_dir(root: &str, url: &str, prefix: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    Path::new(&home)
+    xerj_common::home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".xerj")
         .join("autoindex")
         .join(crate::ids::state_key(root, url, prefix))

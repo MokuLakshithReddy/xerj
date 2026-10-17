@@ -1,0 +1,56 @@
+# cisa-kev — CISA Known Exploited Vulnerabilities (KEV) catalog.
+#
+# Second-domain corpus pack (#1110) proving the corpus builder generalizes
+# without Rust/OSV assumptions:
+# - Upstream is a single wrapped JSON document (`kind = "http-json"`,
+#   `records_field = "vulnerabilities"`) rather than an OSV zip or git tree.
+# - Records use `format = "flat"` (no OSV or RustSec adapter) with domain-native
+#   keys (`cveID`, `vendorProject`, `product`, `vulnerabilityName`,
+#   `shortDescription`, `requiredAction`, `knownRansomwareCampaignUse`, `cwes`).
+# - Licence: US federal government work (17 U.S.C. § 105), public domain /
+#   CC0-1.0 equivalent.
+
+[recipe]
+format = 1
+name = "cisa-kev"
+description = "CISA Known Exploited Vulnerabilities (KEV) catalog — actively exploited CVEs across all vendors and products"
+
+[[sources]]
+slug = "kev"
+kind = "http-json"
+url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+records_field = "vulnerabilities"
+format = "flat"
+licence = "CC0-1.0"
+
+[envelope]
+id_from = ["cveID"]
+title_from = ["vulnerabilityName", "cveID"]
+body_join = ["vendorProject", "product", "vulnerabilityName", "shortDescription", "requiredAction", "notes"]
+defs_from = ["vendorProject", "product", "cwes"]
+
+[identity]
+edges = [{ field = "cveID" }]
+canonical_source_order = ["kev"]
+
+[merge]
+precedence = ["kev"]
+
+[[derived]]
+name = "cwe_ids"
+op = "regex_extract"
+from = ["cwes", "notes"]
+pattern = '\bCWE-\d+\b'
+unique = true
+
+[[derived]]
+name = "ransomware_status"
+op = "map"
+from = ["knownRansomwareCampaignUse"]
+rules = [
+  { match = "(?i)^known$", value = "known" },
+]
+default = "unknown"
+
+[emit]
+shards = 8
