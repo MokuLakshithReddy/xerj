@@ -63,7 +63,7 @@
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-07-08",
-  "dateModified": "2026-09-08",
+  "dateModified": "2026-10-17",
   "author": {
     "@id": "https://xerj.org/#organization"
   },
@@ -216,7 +216,7 @@
   <div class="kicker"><span>FOR AI · 03</span></div>
   <h1>Endpoint contract</h1>
 
-  <p>The exact wire contract for the six <em>HTTP</em> agent operations plus the data endpoints they build on. The seventh canonical operation, <code class="inline">xerj_autoindex</code>, is a CLI subcommand with no endpoint — its contract is in the <a href="/docs/recipes/zero-config-autoindex">zero-config indexing recipe</a>. Everything is on port <code class="inline">9200</code>, JSON in and JSON out. Optional fields are marked <code class="inline">?</code>. Response shapes are shown as they actually come back from a live XERJ.</p>
+  <p>The exact wire contract for the six <em>HTTP</em> agent operations plus the data endpoints they build on, and the three MCP-only <a href="#hub-tools">Corpus Hub tools</a>. The seventh canonical operation, <code class="inline">xerj_autoindex</code>, is a CLI subcommand with no endpoint — its contract is in the <a href="/docs/recipes/zero-config-autoindex">zero-config indexing recipe</a>. Everything is on port <code class="inline">9200</code>, JSON in and JSON out. Optional fields are marked <code class="inline">?</code>. Response shapes are shown as they actually come back from a live XERJ.</p>
 
   <h2>At a glance</h2>
   <div class="api">
@@ -408,6 +408,28 @@ POST /logs/_bulk
 {"service":"auth","level":"error","message":"login failed"}
 → {"errors": false, "items": [{"index": {"status": 201, …}}]}</pre>
   <p>Freshly indexed documents become searchable after a refresh; call <code class="inline">POST /{index}/_refresh</code> in a test loop, or rely on the periodic refresh in normal operation.</p>
+
+  <h2 id="hub-tools">Corpus Hub tools (MCP only)</h2>
+  <p>Three MCP tools answer from <a href="/docs/corpus-hub">Corpus Hub</a> packs: pinned, signed corpora that CI has already indexed. They have no HTTP endpoint of their own; <code class="inline">xerj mcp</code> runs the same flow as the <code class="inline">xerj ask</code> command, against the node on <code class="inline">XERJ_URL</code> or, when none answers there, the node <code class="inline">xerj ask</code> starts. A build with no hub key does not list them.</p>
+<pre class="code">xerj_hub_ask   {question: string, corpus?: string, mode?: "def"|"how"|"files", max_tokens?: 1..8192}
+               → one answer; with no corpus, routed like xerj ask (several candidates come back
+                 as a list: re-ask with corpus)
+xerj_hub_def   {slug: string, symbol: string, k?: 1..50}
+               → the definition: file:line, declaration, value: for a constant or macro
+xerj_hub_find  {question: string, k?: 1..10}
+               → candidate corpora with pin, licence and whether the pack is cached; no passages</pre>
+  <p>The result text is the same rendering the shell prints; the structured content is the answer JSON (<code class="inline">corpus</code>, <code class="inline">pin_sha</code>, <code class="inline">pin_date</code>, <code class="inline">age_days</code>, <code class="inline">licence_spdx</code>, <code class="inline">licence_class</code>, <code class="inline">answered_from</code>, <code class="inline">mode</code>, <code class="inline">hits[]</code> with <code class="inline">file</code>, <code class="inline">line</code>, <code class="inline">kind</code>, <code class="inline">text</code>, <code class="inline">value</code>, <code class="inline">score</code>, <code class="inline">licence_warning</code>, then <code class="inline">truncated</code>, <code class="inline">warnings</code>). Example, <code class="inline">xerj_hub_def {"slug": "lz4", "symbol": "LZ4_VERSION_RELEASE"}</code>:</p>
+<pre class="code">lz4  pin 2026-10-02 (15 days old)  mixed: BSD-2 (lib) / GPL-2.0+ (rest)  lz4/lib/lz4.h:133
+#define LZ4_VERSION_RELEASE  0    /* for tweaks, bug-fixes, or development */
+value: 0
+  approach-only licence (mixed: BSD-2 (lib) / GPL-2.0+ (rest)): read, do not copy
+answered from: local pack
+warning: approach-only licence (mixed: BSD-2 (lib) / GPL-2.0+ (rest)): read, do not copy</pre>
+  <p><strong>The tools never download.</strong> A tool call does not wait on the network: it reads the catalogue already cached and the packs already on the machine. Until a human or a shell agent has run <code class="inline">xerj hub sync</code> once and <code class="inline">xerj hub pull &lt;slug&gt;</code> for the corpus, the call returns <code class="inline">isError: true</code> with the command to run:</p>
+<pre class="code">no hub catalogue is cached on this machine, and hub tools never fetch one (a tool call does not wait on the network); run `xerj hub sync` in a shell once, then call the tool again (…)
+no local pack for 'lz4' and --no-fetch forbids downloading it; run: xerj hub pull lz4 (5.5 MB)</pre>
+  <p>Report that line to the user; do not answer from memory instead. Registration per client, the routing rules and every other message: <a href="/docs/corpus-hub#mcp">Corpus Hub · MCP</a>. Schemas: <a href="/docs/agents/schemas/mcp-tools.json">mcp-tools.json</a>.</p>
+  <p class="source-note">Tools: engine/crates/xerj-mcp/src/lib.rs · flow: engine/crates/xerj-hub/src/ask.rs</p>
 
   <div class="next">
       <div class="step"><span class="dir">◀ PREV</span><a href="/docs/agents/quickstart">Agent quickstart</a></div>

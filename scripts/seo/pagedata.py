@@ -346,14 +346,14 @@ PAGES: dict[str, dict[str, str]] = {
     # ── docs · reference ────────────────────────────────────────────────────
     "docs/cli.html": dict(
         label="CLI reference", kind="techarticle",
-        description="The xerj command line — server flags, config and data-dir overrides, and the autoindex, index, brain and mcp subcommands that drive a running node.",
+        description="The xerj command line — server flags, config and data-dir overrides, the autoindex and mcp subcommands, and the Corpus Hub commands: ask, hub and code --def.",
     ),
-    # Registry + contribution guide for the corpus-hub branch; mirrors
-    # tools/xerj-code/hub/CONTRIBUTING.md on that branch (the branch is the
-    # source of record for rules; this page is the walkthrough).
+    # Corpus Hub v2 consumer guide (xerj ask / xerj hub / MCP hub tools) plus the
+    # contribution walkthrough for the corpus-hub branch, whose
+    # tools/xerj-code/hub/CONTRIBUTING.md stays the source of record for rules.
     "docs/corpus-hub.html": dict(
         label="Corpus Hub", kind="techarticle",
-        description="The corpus registry: two lanes (reference corpora and record packs), the manifest and recipe formats field by field, the human licence-review contract, and the pull-request path with CI validation.",
+        description="Ask a pinned, signed, pre-indexed corpus with xerj ask: pulling packs, the node that holds them, offline use, the MCP hub tools, exit codes, and how to contribute a corpus.",
     ),
     "docs/config.html": dict(
         label="Config TOML", kind="techarticle",

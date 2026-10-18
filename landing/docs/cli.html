@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XERJ.ai · Docs · CLI reference</title>
-<meta name="description" content="The xerj command line — server flags, config and data-dir overrides, and the autoindex, index, brain and mcp subcommands that drive a running node.">
+<meta name="description" content="The xerj command line — server flags, config and data-dir overrides, the autoindex and mcp subcommands, and the Corpus Hub commands: ask, hub and code --def.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -15,7 +15,7 @@
 <meta property="og:site_name" content="XERJ.ai">
 <meta property="og:type" content="article">
 <meta property="og:title" content="XERJ.ai · Docs · CLI reference">
-<meta property="og:description" content="The xerj command line — server flags, config and data-dir overrides, and the autoindex, index, brain and mcp subcommands that drive a running node.">
+<meta property="og:description" content="The xerj command line — server flags, config and data-dir overrides, the autoindex and mcp subcommands, and the Corpus Hub commands: ask, hub and code --def.">
 <meta property="og:url" content="https://xerj.org/docs/cli">
 <meta property="og:image" content="https://xerj.org/og/xerj-card.png">
 <meta property="og:image:width" content="1200">
@@ -24,7 +24,7 @@
 <meta property="og:locale" content="en_US">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="XERJ.ai · Docs · CLI reference">
-<meta name="twitter:description" content="The xerj command line — server flags, config and data-dir overrides, and the autoindex, index, brain and mcp subcommands that drive a running node.">
+<meta name="twitter:description" content="The xerj command line — server flags, config and data-dir overrides, the autoindex and mcp subcommands, and the Corpus Hub commands: ask, hub and code --def.">
 <meta name="twitter:image" content="https://xerj.org/og/xerj-card.png">
 <script type="application/ld+json">
 {
@@ -58,12 +58,12 @@
   "@context": "https://schema.org",
   "@type": "TechArticle",
   "headline": "XERJ.ai · Docs · CLI reference",
-  "description": "The xerj command line — server flags, config and data-dir overrides, and the autoindex, index, brain and mcp subcommands that drive a running node.",
+  "description": "The xerj command line — server flags, config and data-dir overrides, the autoindex and mcp subcommands, and the Corpus Hub commands: ask, hub and code --def.",
   "url": "https://xerj.org/docs/cli",
   "image": "https://xerj.org/og/xerj-card.png",
   "inLanguage": "en",
   "datePublished": "2026-06-29",
-  "dateModified": "2026-09-08",
+  "dateModified": "2026-10-17",
   "author": {
     "@id": "https://xerj.org/#organization"
   },
@@ -204,7 +204,7 @@
   </div>
   <div class="group">
     <span class="label">CORPUS HUB</span>
-    <a href="/docs/corpus-hub" class=""><span class="eyebrow">01</span>Registry &amp; contributing</a>
+    <a href="/docs/corpus-hub" class=""><span class="eyebrow">01</span>Ask, pull &amp; contribute</a>
   </div>
 </nav>
 
@@ -222,7 +222,7 @@
   <h1>CLI reference</h1>
 
 
-  <p>Bare <code class="inline">xerj</code> starts the server, and everything the engine itself does is controlled by the TOML config and driven through the HTTP API. The subcommands — <a href="#autoindex"><code class="inline">autoindex</code></a>, <code class="inline">index</code>, <code class="inline">brain</code>, <a href="#mcp"><code class="inline">mcp</code></a> — are <em>clients</em> of a running node, not other ways to run one.</p>
+  <p>Bare <code class="inline">xerj</code> starts the server, and everything the engine itself does is controlled by the TOML config and driven through the HTTP API. The subcommands — <a href="#autoindex"><code class="inline">autoindex</code></a>, <code class="inline">index</code>, <code class="inline">brain</code>, <a href="#mcp"><code class="inline">mcp</code></a>, and the Corpus Hub commands <a href="#ask"><code class="inline">ask</code></a>, <a href="#hub"><code class="inline">hub</code></a> and <a href="#code-def"><code class="inline">code --def</code></a> — are <em>clients</em> of a running node, not other ways to run one. (<code class="inline">xerj ask</code> starts a node of its own when none answers; see <a href="#ask">below</a>.)</p>
 
 <pre class="code">USAGE:
   xerj [OPTIONS]
@@ -242,7 +242,13 @@ SUBCOMMANDS:
   index      &lt;opts&gt;            direct NDJSON → engine ingest
   autoindex  &lt;folder&gt; [opts]   zero-config folder discovery + indexing
   brain      &lt;folder&gt;          index a folder into a browsable second brain
-  mcp        [opts]            Model Context Protocol stdio server</pre>
+  mcp        [opts]            Model Context Protocol stdio server
+  ask        "&lt;question&gt;"      answer from a Corpus Hub pack (pulled on first use)
+  hub        &lt;command&gt;         pull, sync, status, stop, config; build-pack and
+                               build-catalogue for CI
+  code       &lt;corpus&gt; "&lt;q&gt;"   retrieval over a corpus; --def &lt;SYMBOL&gt; for one definition
+  corpus     add|index|list    clone + index your own reference corpora</pre>
+  <p>Abridged. <code class="inline">xerj --help</code> prints every subcommand; each prints its own options with <code class="inline">--help</code>.</p>
 
   <h2 id="config-flag">--config / -c</h2>
   <p>Path to the TOML config. Defaults to <code class="inline">./xerj.toml</code>. The <code class="inline">XERJ_CONFIG</code> environment variable is consulted only if this flag is absent.</p>
@@ -290,12 +296,155 @@ $ xerj autoindex ~/my-project --api-key "$(cat ./data/admin.key)"</pre>
   <p>Against a node started with <code class="inline">--insecure</code> no key is needed, because that flag clears <code class="inline">auth.enabled</code> too.</p>
 
   <p class="source-note">Source · engine/crates/xerj-server/src/main.rs · engine/crates/xerj-autoindex/src/cli.rs</p>
+  <h2 id="ask">xerj ask "&lt;question&gt;"</h2>
+  <p>Answers a question from a <a href="/docs/corpus-hub">Corpus Hub</a> pack: a pinned, signed corpus that CI has already indexed. The first question to a corpus downloads its pack, checks the sha256 and the ed25519 signature, and restores it into a node; later questions answer from that pack. The answer always names the corpus, the pin and the licence. <code class="inline">xerj "&lt;question&gt;"</code> is the same command when the question contains a space. The help text, as the binary prints it:</p>
+<pre class="code">usage: xerj ask "&lt;question&gt;" [options]
+       xerj "&lt;question&gt;"            (the same, when the question contains a space)
+
+Answers from a hub corpus - pulling its pre-indexed pack the first time - and
+always names the corpus, the pinned revision and the licence.
+
+options:
+  --corpus &lt;slug&gt;        skip routing and ask this corpus
+  --def &lt;SYMBOL&gt;         exact definition lookup (file:line, declaration, value)
+  --how                  a how-does-it-work question (ranked passages)
+  --files                list the relevant files with their licences
+  --offline              never touch the network (cached catalogue and packs only)
+  --no-fetch             do not download a pack for next time
+  --hosted on|off|auto   may the question be sent to the hosted hub? (default
+                         auto: off inside a git repository, on elsewhere)
+  --max-tokens N         cap the answer at about N tokens
+  --json                 print the answer as JSON
+  --url &lt;node&gt;           the node that holds the packs (default: XERJ_URL, then
+                         localhost:9200, else a local node is started)
+
+exit codes: 0 answered; 1 no match or nothing to answer from; 2 usage error or
+unknown corpus; 3 a pack failed verification; 4 more than one corpus matches
+(candidates are printed; re-run with --corpus &lt;slug&gt;); 5 this build has no hub
+public key, so no pack can be verified (nothing was downloaded)</pre>
+  <p>Example, with the pack already on disk:</p>
+<pre class="code">$ xerj ask --def LZ4_VERSION_RELEASE
+lz4  pin 2026-10-02 (15 days old)  mixed: BSD-2 (lib) / GPL-2.0+ (rest)  lz4/lib/lz4.h:133
+#define LZ4_VERSION_RELEASE  0    /* for tweaks, bug-fixes, or development */
+value: 0
+  approach-only licence (mixed: BSD-2 (lib) / GPL-2.0+ (rest)): read, do not copy
+answered from: local pack
+warning: approach-only licence (mixed: BSD-2 (lib) / GPL-2.0+ (rest)): read, do not copy</pre>
+  <p>Verify: <code class="inline">answered from: local pack</code> in the output and exit 0. Three things the help does not say. Packs over 50 MiB (<code class="inline">AUTO_PULL_MAX_BYTES</code>) are not downloaded, and no flag overrides that. This build has no hosted-answer client: whatever <code class="inline">--hosted</code> says, the question is answered on this machine and is never sent to the hub. And this build writes no <code class="inline">xerj.lock</code> and has no <code class="inline">--locked</code> flag. The walkthrough, the routing rules and every message are on the <a href="/docs/corpus-hub#first-question">Corpus Hub page</a>.</p>
+
+  <h2 id="hub">xerj hub &lt;command&gt;</h2>
+  <p>Manages the pack cache, the catalogue and the node <code class="inline">xerj ask</code> starts. <code class="inline">xerj hub --help</code> prints this, and so does <code class="inline">--help</code> after any command other than <code class="inline">sync</code> and <code class="inline">build-catalogue</code>, which have their own:</p>
+<pre class="code">usage: xerj hub &lt;command&gt;
+
+  build-pack &lt;slug&gt; --registry &lt;dir&gt; --out &lt;dir&gt; --url &lt;node&gt; --sign-key &lt;seed-file&gt;
+        Build a signed, pre-indexed pack from a registry manifest (CI).
+  build-catalogue --registry &lt;dir&gt; --packs &lt;dir&gt; --out &lt;file&gt; --sign-key &lt;seed-file&gt;
+        Build and sign the catalogue from verified packs (CI; see -h).
+  sync [--url &lt;node&gt;] | sync --install-timer
+        Refresh the catalogue and bring every cached pack up to its pin;
+        --install-timer schedules that every 6 hours (see `xerj hub sync -h`).
+  pull &lt;slug&gt; [--quiet] [--url &lt;node&gt;]
+        Download, verify and restore a pack, then `xerj code &lt;slug&gt;` works.
+        Exits 2 for an unknown corpus, 3 when the pack fails verification, 5 when
+        this build has no hub public key to verify with (nothing is downloaded),
+        1 for anything else (an excluded licence and a pack over the size limit
+        are refused here too).
+  status
+        Cached packs, the automatic node, the hosted setting, catalogue age.
+  stop
+        Stop the automatic node `xerj ask` started (only that process).
+  config hosted on|off|auto
+        Whether questions may be sent to the hosted hub (default auto: off
+        inside a git repository, on elsewhere).
+
+Ask a question with `xerj ask "&lt;question&gt;"` (see `xerj ask --help`).
+
+Packs are pulled on demand and never cloned or indexed on the user's machine
+(docs/CORPUS_HUB_V2_IMPLEMENTATION.md).</pre>
+  <p>There is no <code class="inline">xerj hub find</code> (it exits 2 with <code class="inline">unknown command 'find'</code>); to see which corpora could answer a question, use the MCP tool <a href="#mcp"><code class="inline">xerj_hub_find</code></a> or run <code class="inline">xerj ask</code>, which prints the candidates when more than one fits. <code class="inline">update</code> and <code class="inline">rm</code> do not exist either.</p>
+
+  <h3 id="hub-pull">hub pull</h3>
+<pre class="code">$ xerj hub pull snappy
+pulled snappy 9c28114a 15034490 → 3 indices, 382 definitions
+$ xerj hub pull snappy
+snappy: already present</pre>
+  <p>Verify: exit 0, and <code class="inline">xerj hub status</code> lists a <code class="inline">pack: snappy</code> line. <code class="inline">--quiet</code> drops the progress notices. <code class="inline">--url</code> picks the node to restore into (default <code class="inline">XERJ_URL</code>, then <code class="inline">localhost:9200</code>, else the automatic node). A node you started yourself must allow the pack directory as a snapshot location; the fix is on the <a href="/docs/corpus-hub#node">Corpus Hub page</a>.</p>
+
+  <h3 id="hub-sync">hub sync</h3>
+<pre class="code">usage: xerj hub sync [--url &lt;node&gt;]
+       xerj hub sync --install-timer
+
+Refresh the catalogue, then bring every cached pack up to the catalogue's pin:
+the new pin is pulled by `xerj hub pull` (sha256 and signature are verified
+before anything is extracted), the old pin's directory is removed only after the
+new one is restored, and the cache is pruned to the 4.0 GB disk budget, least
+recently used first. `~/.xerj/hub/last_sync` is written when nothing failed.
+
+  --url &lt;node&gt;      the node the packs are restored into (passed to `hub pull`)
+  --install-timer   write a systemd user timer (Linux) or a launchd agent
+                    (macOS) that runs `xerj hub sync` every 6 hours, and print
+                    its path. Nothing is enabled, loaded or started: the
+                    comment at the top of the written file says how.
+
+exit codes: 0 synced (or nothing to do); 1 the catalogue could not be refreshed
+or a pack could not be updated (its old pin is kept); 2 usage error; 3 a pack
+failed verification (its old pin is kept)</pre>
+  <p>Verify: the last line reads <code class="inline">hub sync: &lt;n&gt; updated, &lt;n&gt; current, &lt;n&gt; kept, 0 failed, &lt;n&gt; pruned</code> and the exit code is 0. Run it once before using the <a href="#mcp">MCP hub tools</a>: they read the cached catalogue and never fetch one.</p>
+
+  <h3 id="hub-status">hub status, hub stop, hub config</h3>
+<pre class="code">$ xerj hub status
+pack: lz4 0774d055  15 days old  8.1 MB  last used today
+node: running  pid 2789576  port 9300
+hosted: auto
+last sync: today
+catalogue: 0 days old
+$ xerj hub stop
+stopped the hub node (pid 2789576)
+$ xerj hub config hosted off
+hosted = off</pre>
+  <p>Verify: after <code class="inline">stop</code>, <code class="inline">xerj hub status</code> shows <code class="inline">node: not running</code>, and a second <code class="inline">stop</code> prints <code class="inline">no hub node was started by xerj; nothing to stop</code>. <code class="inline">stop</code> signals only the PID <code class="inline">xerj ask</code> recorded; it never touches a node you started.</p>
+
+  <h3 id="hub-build">hub build-pack, hub build-catalogue (CI)</h3>
+  <p>These two build what users download. They need the hub signing seed, so in practice they run in <code class="inline">.github/workflows/hub-packs.yml</code>; they are documented here so the pipeline can be reproduced with a throwaway key. <code class="inline">build-pack</code> clones the corpus at its manifest's pinned commit, indexes it into the node at <code class="inline">--url</code> (which must allow <code class="inline">--out</code> in <code class="inline">[limits] snapshot_repo_allowlist</code>), snapshots it and signs the archive. Its last stdout line is <code class="inline">pack &lt;slug&gt; &lt;pin8&gt; &lt;bytes&gt; &lt;indices&gt; &lt;defs&gt;</code>, for example <code class="inline">pack lz4 0774d055 5810327 2 1702</code>.</p>
+<pre class="code">usage: xerj hub build-catalogue --registry &lt;dir&gt; --packs &lt;dir&gt; --out &lt;file&gt; --sign-key &lt;seed-file&gt;
+                                  [--backlog &lt;file&gt;] [--release-base &lt;url&gt;] [--tags &lt;tsv&gt;]
+
+Builds and signs the hub catalogue (writes &lt;out&gt; and &lt;out&gt;.sig) from the packs in
+--packs (`&lt;slug&gt;-&lt;pin8&gt;.hubpack.tar.zst` + `.sig`, as `hub build-pack --out` writes
+them). One entry per live lane-A corpus in the backlog (default
+&lt;registry&gt;/backlog/backlog-100.json) whose current pin has a pack there.
+
+  --release-base &lt;url&gt;  pack_url prefix (default
+                        https://github.com/xerj-org/xerj/releases/download)
+  --tags &lt;tsv&gt;          `slug&lt;TAB&gt;pin8&lt;TAB&gt;tag` lines naming each pack's release
+                        tag (a -rN retag); default tag pack-&lt;slug&gt;-&lt;pin8&gt;
+
+Every pack is verified (sha256, signature against the hub key this build embeds,
+format, slug and pin) before it is listed; any failure aborts.</pre>
+  <p>Verify: it prints <code class="inline">catalogue &lt;n&gt; corpora, &lt;bytes&gt; bytes (…)</code> and writes both files. The per-pack consumer check CI runs before it publishes a pack is <code class="inline">tools/hub-packs/consumer_e2e.sh</code>.</p>
+
+  <h2 id="code-def">xerj code &lt;corpus&gt; --def &lt;SYMBOL&gt;</h2>
+  <p><code class="inline">xerj code</code> searches a corpus held by a node: one you built with <a href="#corpus"><code class="inline">xerj corpus</code></a>, or a hub pack after <code class="inline">xerj hub pull</code>. With <code class="inline">--def</code> it looks up one definition and prints it in the same format as <code class="inline">xerj ask --def</code>:</p>
+<pre class="code">usage: xerj code &lt;corpus&gt; --def &lt;SYMBOL&gt; [-k N] [--json] [--url URL]
+
+$ xerj code lz4 --def LZ4_MAX_INPUT_SIZE --url http://127.0.0.1:9300
+lz4  pin 2026-10-02 (15 days old)  mixed: BSD-2 (lib) / GPL-2.0+ (rest)  lz4/lib/lz4.h:214
+#define LZ4_MAX_INPUT_SIZE        0x7E000000   /* 2 113 929 216 bytes */
+value: 0x7E000000
+  approach-only licence (mixed: BSD-2 (lib) / GPL-2.0+ (rest)): read, do not copy
+answered from: local pack</pre>
+  <p>Verify: exit 0 and a <code class="inline">value:</code> line. Unlike <code class="inline">xerj ask</code>, <code class="inline">xerj code</code> never starts a node: it queries <code class="inline">--url</code>, else <code class="inline">XERJ_URL</code>, else <code class="inline">localhost:9200</code>. To read a pack restored into the node <code class="inline">xerj ask</code> started, pass that node's port from <code class="inline">xerj hub status</code>, as above. Pointed at a node that does not hold the pack, it prints <code class="inline">defs query failed: …</code> and <code class="inline">no match in lz4</code>, and exits 1. <code class="inline">xerj code --help</code> prints the options for the passage search (<code class="inline">xerj code &lt;corpus&gt; "&lt;what you need&gt;"</code>); <code class="inline">xerj code --def X --help</code> prints the usage line above.</p>
+
+  <h2 id="corpus">xerj corpus add|index|list</h2>
+  <p>Clones and indexes reference corpora <em>on your machine</em> for <code class="inline">xerj code</code>: <code class="inline">xerj corpus add &lt;name&gt; &lt;git-url&gt;…</code> (or <code class="inline">--from &lt;manifest file&gt;</code>), then <code class="inline">xerj corpus index &lt;name&gt;</code>. Use it for corpora you define yourself. For a corpus the hub already publishes, <code class="inline">xerj ask</code> or <code class="inline">xerj hub pull</code> downloads it pre-indexed instead. <code class="inline">xerj corpus --help</code> prints the options.</p>
+
+  <p class="source-note">Source · engine/crates/xerj-hub/src/cli.rs · engine/crates/xerj-hub/src/sync.rs · engine/crates/xerj-hub/src/build_catalogue.rs · engine/crates/xerj-autoindex/src/xc.rs</p>
   <h2 id="mcp">xerj mcp</h2>
   <p>Starts a <strong>Model Context Protocol</strong> server on stdio — newline-delimited JSON-RPC 2.0 on stdin/stdout — so any MCP client (desktop assistants, IDE agents, function-calling hosts) can query XERJ without a shell. It is part of the single installed binary: if you ran the installer, you already have it.</p>
 
   <p>It does <strong>not</strong> start a node. Start one first; <code class="inline">xerj mcp</code> proxies every tool call to the URL in <code class="inline">XERJ_URL</code>.</p>
 
-<pre class="code">xerj --insecure --data-dir ./data &amp;    # 1. the node
+<pre class="code">xerj --insecure --data-dir ~/xerj-data &amp;   # 1. the node
 xerj mcp                               # 2. the MCP server (your client runs this)
 
 OPTIONS:
@@ -320,9 +469,9 @@ OPTIONS:
 
   <p>Use an <em>absolute</em> path — the installer puts <code class="inline">xerj</code> in <code class="inline">~/.local/bin</code> by default (<code class="inline">command -v xerj</code> confirms), and an MCP host launched from a desktop icon does not inherit your shell's <code class="inline">PATH</code>. When the node is not running <code class="inline">--insecure</code>, add <code class="inline">"XERJ_AUTH": "ApiKey &lt;key&gt;"</code> next to <code class="inline">XERJ_URL</code>; the key lives in <code class="inline">&lt;data-dir&gt;/admin.key</code>. For a loopback node that manual step is optional: with no <code class="inline">XERJ_AUTH</code> given, the server reads <code class="inline">&lt;data-dir&gt;/admin.key</code> itself (the same locations <code class="inline">xerj autoindex</code> checks) and announces the file it used on stderr — it never does this for a non-loopback URL.</p>
 
-  <p>Thirteen tools are served. Eleven are thin proxies over an endpoint the engine already exposes — nothing is added, and engine errors come back verbatim: <code class="inline">xerj_search</code>, <code class="inline">xerj_semantic_search</code>, <code class="inline">xerj_vector_search</code>, <code class="inline">xerj_hybrid_search</code>, <code class="inline">xerj_memory_store</code>, <code class="inline">xerj_memory_recall</code>, <code class="inline">xerj_brain_overview</code>, <code class="inline">xerj_brain_ego</code>, <code class="inline">xerj_brain_link</code>, <code class="inline">xerj_brain_unlink</code>, <code class="inline">xerj_plan</code> (<code class="inline">POST /_ask</code>). Two are not plain proxies: <code class="inline">xerj_map</code> returns the autoindex catalog's per-index field map (trimmed to a byte cap), and <code class="inline">xerj_code_search</code> runs the <code class="inline">xerj code</code> pipeline and returns its rendered text. Two caveats the tool descriptions carry themselves: <code class="inline">xerj_semantic_search</code> embeds server-side with the <em>lexical</em> feature-hashing embedder unless the node runs <code class="inline">--embed-mode neural</code>, and the <code class="inline">xerj_brain_*</code> tools work a deterministic link index, not a graph database.</p>
+  <p>Sixteen tools are served (thirteen in a build with no hub key, which omits the three hub tools). Eleven are thin proxies over an endpoint the engine already exposes — nothing is added, and engine errors come back verbatim: <code class="inline">xerj_search</code>, <code class="inline">xerj_semantic_search</code>, <code class="inline">xerj_vector_search</code>, <code class="inline">xerj_hybrid_search</code>, <code class="inline">xerj_memory_store</code>, <code class="inline">xerj_memory_recall</code>, <code class="inline">xerj_brain_overview</code>, <code class="inline">xerj_brain_ego</code>, <code class="inline">xerj_brain_link</code>, <code class="inline">xerj_brain_unlink</code>, <code class="inline">xerj_plan</code> (<code class="inline">POST /_ask</code>). Two are not plain proxies: <code class="inline">xerj_map</code> returns the autoindex catalog's per-index field map (trimmed to a byte cap), and <code class="inline">xerj_code_search</code> runs the <code class="inline">xerj code</code> pipeline and returns its rendered text. The three Corpus Hub tools, <code class="inline">xerj_hub_ask</code>, <code class="inline">xerj_hub_def</code> and <code class="inline">xerj_hub_find</code>, run the <a href="#ask"><code class="inline">xerj ask</code></a> flow, but never download a pack and never fetch the catalogue: run <code class="inline">xerj hub sync</code> and <code class="inline">xerj hub pull &lt;slug&gt;</code> in a shell first (details on the <a href="/docs/corpus-hub#mcp">Corpus Hub page</a>). Two caveats the tool descriptions carry themselves: <code class="inline">xerj_semantic_search</code> embeds server-side with the <em>lexical</em> feature-hashing embedder unless the node runs <code class="inline">--embed-mode neural</code>, and the <code class="inline">xerj_brain_*</code> tools work a deterministic link index, not a graph database.</p>
 
-  <p>Machine-readable schemas for all thirteen: <a href="/docs/agents/schemas/mcp-tools.json">/docs/agents/schemas/mcp-tools.json</a>, generated from a live <code class="inline">tools/list</code> and gated against the binary in CI.</p>
+  <p>Machine-readable schemas for all sixteen: <a href="/docs/agents/schemas/mcp-tools.json">/docs/agents/schemas/mcp-tools.json</a>, generated from a live <code class="inline">tools/list</code> and gated against the binary in CI.</p>
 
   <p class="source-note">Source · engine/crates/xerj-server/src/main.rs · engine/crates/xerj-mcp/src/lib.rs</p>
   
@@ -334,7 +483,7 @@ OPTIONS:
 
   <!-- Print-only branded footer (hidden on screen, visible in PDF) -->
   <div class="print-footer" style="display:none;">
-    <span>XERJ.AI · V1.0.0-RC.96 · 2026-08-11</span>
+    <span>XERJ.AI · V1.0.0-RC.96 · 2026-10-17</span>
     <a href="https://xerj.org/docs/">https://xerj.org/docs/</a>
     <span>CLI reference</span>
   </div>
@@ -397,7 +546,7 @@ OPTIONS:
   <span><a href="/">HOME</a> · <a href="/product">PRODUCT</a> · <a href="/brand">BRAND</a> · <a href="/playground">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
 </footer>
 
-<script type="application/json" id="docs-index">[{"title":"Corpus Hub","slug":"/docs/corpus-hub","kicker":"CORPUS HUB","snip":"Registry of corpora for agents — reference code and record packs, pinned, licenced, signed."},{"title":"Overview","slug":"/docs/","kicker":"START","snip":""},{"title":"Quickstart","slug":"/docs/quickstart","kicker":"START","snip":""},{"title":"Install","slug":"/docs/install","kicker":"START","snip":""},{"title":"Migrate from ES","slug":"/docs/migration-from-es","kicker":"START","snip":""},{"title":"CLI","slug":"/docs/cli","kicker":"REFERENCE","snip":""},{"title":"Config TOML","slug":"/docs/config","kicker":"REFERENCE","snip":""},{"title":"Environment","slug":"/docs/env","kicker":"REFERENCE","snip":""},{"title":"Native REST API","slug":"/docs/api-native","kicker":"REFERENCE","snip":""},{"title":"ES-compat API","slug":"/docs/api-es-compat","kicker":"REFERENCE","snip":""},{"title":"Query types","slug":"/docs/queries","kicker":"DATA MODEL","snip":""},{"title":"Aggregations","slug":"/docs/aggregations","kicker":"DATA MODEL","snip":""},{"title":"Analyzers","slug":"/docs/analyzers","kicker":"DATA MODEL","snip":""},{"title":"Vectors & kNN","slug":"/docs/vectors","kicker":"DATA MODEL","snip":""},{"title":"Ingest pipelines","slug":"/docs/ingest","kicker":"ENGINE","snip":""},{"title":"Storage & WAL","slug":"/docs/storage","kicker":"ENGINE","snip":""},{"title":"Compression","slug":"/docs/compression","kicker":"ENGINE","snip":""},{"title":"Clustering","slug":"/docs/clustering","kicker":"ENGINE","snip":""},{"title":"Metrics","slug":"/docs/metrics","kicker":"ENGINE","snip":""},{"title":"Auth & TLS","slug":"/docs/security","kicker":"ENGINE","snip":""},{"title":"Running in production","slug":"/docs/operations","kicker":"OPERATIONS","snip":""},{"title":"Backup & restore","slug":"/docs/backup-restore","kicker":"OPERATIONS","snip":""},{"title":"Upgrades","slug":"/docs/upgrades","kicker":"OPERATIONS","snip":""},{"title":"Troubleshooting","slug":"/docs/troubleshooting","kicker":"OPERATIONS","snip":""},{"title":"SIEM","slug":"/docs/playbooks/siem","kicker":"PLAYBOOKS","snip":""},{"title":"Log analytics","slug":"/docs/playbooks/log-analytics","kicker":"PLAYBOOKS","snip":""},{"title":"Vector · RAG","slug":"/docs/playbooks/vector-search","kicker":"PLAYBOOKS","snip":""},{"title":"Full-text search","slug":"/docs/playbooks/full-text","kicker":"PLAYBOOKS","snip":""},{"title":"Observability","slug":"/docs/playbooks/observability","kicker":"PLAYBOOKS","snip":""},{"title":"CLI · --config","slug":"/docs/cli#config-flag","kicker":"CLI","snip":"-c, --config <PATH>  Path to the TOML config file."},{"title":"CLI · --data-dir","slug":"/docs/cli#data-dir-flag","kicker":"CLI","snip":"-d, --data-dir <PATH>  Override [server] data_dir at the command line."},{"title":"CLI · --insecure","slug":"/docs/cli#insecure-flag","kicker":"CLI","snip":"-k, --insecure  Disable TLS and API-key auth. Dev only."},{"title":"[server] rest_port","slug":"/docs/config#server","kicker":"CONFIG","snip":"u16 · default 8080 · Native REST API listener port."},{"title":"[server] es_compat_port","slug":"/docs/config#server","kicker":"CONFIG","snip":"u16 · default 9200 · Elasticsearch-wire-format port. 0 = OS-assigned port."},{"title":"[storage] wal_sync","slug":"/docs/config#storage","kicker":"CONFIG","snip":"enum · default batched · sync · batched · async. Durability knob."},{"title":"[vector] hnsw_ef_search","slug":"/docs/config#vector","kicker":"CONFIG","snip":"u32 · default 100 · Accepted but not wired — the beam width comes from the request num_candidates."},{"title":"[vector] default_quantization","slug":"/docs/config#vector","kicker":"CONFIG","snip":"enum · none (default) · scalar8. binary is refused at startup; scalar4 is not accepted."},{"title":"GET /v1/health","slug":"/docs/api-native#health","kicker":"NATIVE API","snip":"Liveness + readiness. {status, uptime_s, version}."},{"title":"GET /v1/metrics","slug":"/docs/api-native#metrics","kicker":"NATIVE API","snip":"Prometheus text format. Scrape-friendly."},{"title":"POST /v1/indices/:name/turbo-ingest","slug":"/docs/api-native#turbo-ingest","kicker":"NATIVE API","snip":"NDJSON bulk path with parallel tokenization."},{"title":"POST /v1/indices/:name/search","slug":"/docs/api-native#search","kicker":"NATIVE API","snip":"Unified query endpoint — full-text, term, range, KNN, hybrid."},{"title":"POST /:index/_bulk","slug":"/docs/api-es-compat#bulk","kicker":"ES API","snip":"NDJSON bulk. Actions: index, create, update, delete."},{"title":"POST /:index/_search","slug":"/docs/api-es-compat#search","kicker":"ES API","snip":"ES query DSL. Drop-in migration path."},{"title":"match_all","slug":"/docs/queries#match-all","kicker":"QUERY","snip":"Everything in the index."},{"title":"bool","slug":"/docs/queries#bool","kicker":"QUERY","snip":"must / should / must_not / filter clauses."},{"title":"knn","slug":"/docs/queries#knn","kicker":"QUERY","snip":"Vector kNN — HNSW-served when unfiltered (exact-rescored); filtered runs the exact scan."},{"title":"semantic","slug":"/docs/queries#semantic","kicker":"QUERY","snip":"Embed the query text at query time and search the vector field."},{"title":"hybrid","slug":"/docs/queries#hybrid","kicker":"QUERY","snip":"RRF / linear fusion of sub-queries."},{"title":"terms aggregation","slug":"/docs/aggregations#terms","kicker":"AGG","snip":"Exact, pre-computed terms histograms over keyword fields."},{"title":"date_histogram","slug":"/docs/aggregations#date-histogram","kicker":"AGG","snip":"Time-bucketed counts."},{"title":"kNN serving","slug":"/docs/vectors#knn-query","kicker":"VECTORS","snip":"Unfiltered kNN via persisted HNSW + exact rescore; filtered kNN exact scan."},{"title":"SQ8 quantization","slug":"/docs/vectors#quantization","kicker":"VECTORS","snip":"8-bit scalar quantization. int8 scoring precision, not a memory saving (#392)."},{"title":"turbo-ingest","slug":"/docs/ingest#turbo","kicker":"INGEST","snip":"NDJSON bulk path. Parallel tokenization across cores."},{"title":"delta-of-delta","slug":"/docs/compression#delta-of-delta","kicker":"COMPRESSION","snip":"Timestamp encoding. Apache/Nginx/ISO auto-detect."},{"title":"dictionary encoding","slug":"/docs/compression#dictionary","kicker":"COMPRESSION","snip":"Up to 256 unique strings per column."},{"title":"api_key","slug":"/docs/security#api-key","kicker":"SECURITY","snip":"Static admin key. Auto-generated on first run."},{"title":"SIEM playbook","slug":"/docs/playbooks/siem","kicker":"PLAYBOOK","snip":"Terms agg over source IPs for SIEM, with detection rules."},{"title":"RAG playbook","slug":"/docs/playbooks/vector-search","kicker":"PLAYBOOK","snip":"Embeddings, kNN, hybrid search, BM25 + kNN fusion."},{"title":"[cluster] enabled","slug":"/docs/config#cluster","kicker":"CONFIG","snip":"bool · default false · Enable multi-node Raft cluster mode."},{"title":"[cluster] peers","slug":"/docs/config#cluster","kicker":"CONFIG","snip":"array · \"host:port=host:port\" · label must equal address (#1171)."},{"title":"[cluster] port","slug":"/docs/config#cluster","kicker":"CONFIG","snip":"u16 · default 9300 · Intra-cluster Raft + search port."},{"title":"[embedding] default_endpoint","slug":"/docs/config#embedding","kicker":"CONFIG","snip":"string · OpenAI-compatible embeddings URL for auto-embedding on ingest."},{"title":"[embedding] default_model","slug":"/docs/config#embedding","kicker":"CONFIG","snip":"string · Model name (e.g. text-embedding-3-small, nomic-embed-text)."},{"title":"Raft","slug":"/docs/clustering","kicker":"CLUSTER","snip":"Embedded Raft ring — leader election, heartbeats, authenticated transport."},{"title":"Leader failover","slug":"/docs/clustering","kicker":"CLUSTER","snip":"Kill the leader of a 3-node ring: survivors elect a new leader in ~250 ms."},{"title":"Cluster honesty","slug":"/docs/clustering","kicker":"CLUSTER","snip":"What the ring does today; metadata and data replication are roadmap (#1170)."},{"title":"Systemd unit","slug":"/docs/operations","kicker":"OPS","snip":"Production unit file with hardening directives."},{"title":"Readiness probe","slug":"/docs/operations","kicker":"OPS","snip":"GET /v1/health/ready — only 200 once WAL replay is complete."},{"title":"Config reload","slug":"/docs/operations","kicker":"OPS","snip":"SIGHUP reloads most keys without restart."},{"title":"Hot backup","slug":"/docs/backup-restore","kicker":"OPS","snip":"rsync the data dir after POST /v1/admin/flush."},{"title":"S3 backup","slug":"/docs/backup-restore","kicker":"OPS","snip":"POST /v1/admin/backup → any S3-compatible endpoint."},{"title":"Cluster upgrade","slug":"/docs/upgrades","kicker":"OPS","snip":"The cluster wire has no version negotiation — full stop/start, not rolling."},{"title":"Merge pressure","slug":"/docs/troubleshooting","kicker":"OPS","snip":"Segment count climbing → raise merge.max_concurrent + io_rate."},{"title":"Cluster flapping","slug":"/docs/troubleshooting","kicker":"OPS","snip":"Sustained leader churn is a defect — capture RUST_LOG=xerj_cluster=debug and file it."},{"title":"WAL warnings after a crash","slug":"/docs/troubleshooting","kicker":"OPS","snip":"Repaired on startup; no manual repair command."},{"title": "Recipes", "slug": "/docs/recipes/", "kicker": "RECIPES", "snip": "Task-oriented AI & search recipes, each verified end-to-end against a live XERJ."},{"title": "Semantic search & RAG", "slug": "/docs/recipes/semantic-search-rag", "kicker": "RECIPE", "snip": "Retrieval by meaning with semantic_text — auto-embed on ingest, no separate vector DB."},{"title": "Agent memory", "slug": "/docs/recipes/agentic-memory", "kicker": "RECIPE", "snip": "Long-term memory for agents via /_memory — store, recall, forget, per-agent isolation."},{"title": "Passage retrieval", "slug": "/docs/recipes/passage-retrieval", "kicker": "RECIPE", "snip": "Auto-chunk long docs; best-passage (max-sim) scoring — 98% top-3."},{"title": "Vector search · kNN", "slug": "/docs/recipes/vector-search-knn", "kicker": "RECIPE", "snip": "Nearest-neighbor over dense_vector — HNSW-served unfiltered, exact with filters."},{"title": "Vector quantization", "slug": "/docs/recipes/vector-quantization", "kicker": "RECIPE", "snip": "scalar8 (accepts ES int8_hnsw; exact code scan) — int8 scoring at recall@10 = 0.998. Precision, not memory."},{"title": "Hybrid search", "slug": "/docs/recipes/hybrid-search", "kicker": "RECIPE", "snip": "Keyword + vector in one query — RRF fusion."},{"title": "Log analytics", "slug": "/docs/recipes/log-analytics", "kicker": "RECIPE", "snip": "Raw logs to dashboards — error rates, p95 latency, top services."},{"title": "Anomaly detection", "slug": "/docs/recipes/anomaly-detection", "kicker": "RECIPE", "snip": "Statistical _ml detectors that flag spikes in metrics/logs."},{"title": "Anomaly datafeeds", "slug": "/docs/recipes/continuous-anomaly-datafeeds", "kicker": "RECIPE", "snip": "Live _ml datafeed re-scores an index on a timer, stores anomaly records."},{"title": "Migrate from ES", "slug": "/docs/recipes/migrate-from-elasticsearch", "kicker": "RECIPE", "snip": "Point your existing ES client at XERJ — same wire, change the URL."}]</script>
+<script type="application/json" id="docs-index">[{"title":"Corpus Hub","slug":"/docs/corpus-hub","kicker":"CORPUS HUB","snip":"Ask a pinned, signed, pre-indexed corpus: xerj ask, xerj hub pull/sync, the MCP hub tools, and how to contribute a corpus."},{"title":"Overview","slug":"/docs/","kicker":"START","snip":""},{"title":"Quickstart","slug":"/docs/quickstart","kicker":"START","snip":""},{"title":"Install","slug":"/docs/install","kicker":"START","snip":""},{"title":"Migrate from ES","slug":"/docs/migration-from-es","kicker":"START","snip":""},{"title":"CLI","slug":"/docs/cli","kicker":"REFERENCE","snip":""},{"title":"Config TOML","slug":"/docs/config","kicker":"REFERENCE","snip":""},{"title":"Environment","slug":"/docs/env","kicker":"REFERENCE","snip":""},{"title":"Native REST API","slug":"/docs/api-native","kicker":"REFERENCE","snip":""},{"title":"ES-compat API","slug":"/docs/api-es-compat","kicker":"REFERENCE","snip":""},{"title":"Query types","slug":"/docs/queries","kicker":"DATA MODEL","snip":""},{"title":"Aggregations","slug":"/docs/aggregations","kicker":"DATA MODEL","snip":""},{"title":"Analyzers","slug":"/docs/analyzers","kicker":"DATA MODEL","snip":""},{"title":"Vectors & kNN","slug":"/docs/vectors","kicker":"DATA MODEL","snip":""},{"title":"Ingest pipelines","slug":"/docs/ingest","kicker":"ENGINE","snip":""},{"title":"Storage & WAL","slug":"/docs/storage","kicker":"ENGINE","snip":""},{"title":"Compression","slug":"/docs/compression","kicker":"ENGINE","snip":""},{"title":"Clustering","slug":"/docs/clustering","kicker":"ENGINE","snip":""},{"title":"Metrics","slug":"/docs/metrics","kicker":"ENGINE","snip":""},{"title":"Auth & TLS","slug":"/docs/security","kicker":"ENGINE","snip":""},{"title":"Running in production","slug":"/docs/operations","kicker":"OPERATIONS","snip":""},{"title":"Backup & restore","slug":"/docs/backup-restore","kicker":"OPERATIONS","snip":""},{"title":"Upgrades","slug":"/docs/upgrades","kicker":"OPERATIONS","snip":""},{"title":"Troubleshooting","slug":"/docs/troubleshooting","kicker":"OPERATIONS","snip":""},{"title":"SIEM","slug":"/docs/playbooks/siem","kicker":"PLAYBOOKS","snip":""},{"title":"Log analytics","slug":"/docs/playbooks/log-analytics","kicker":"PLAYBOOKS","snip":""},{"title":"Vector · RAG","slug":"/docs/playbooks/vector-search","kicker":"PLAYBOOKS","snip":""},{"title":"Full-text search","slug":"/docs/playbooks/full-text","kicker":"PLAYBOOKS","snip":""},{"title":"Observability","slug":"/docs/playbooks/observability","kicker":"PLAYBOOKS","snip":""},{"title":"CLI · --config","slug":"/docs/cli#config-flag","kicker":"CLI","snip":"-c, --config <PATH>  Path to the TOML config file."},{"title":"CLI · --data-dir","slug":"/docs/cli#data-dir-flag","kicker":"CLI","snip":"-d, --data-dir <PATH>  Override [server] data_dir at the command line."},{"title":"CLI · --insecure","slug":"/docs/cli#insecure-flag","kicker":"CLI","snip":"-k, --insecure  Disable TLS and API-key auth. Dev only."},{"title":"[server] rest_port","slug":"/docs/config#server","kicker":"CONFIG","snip":"u16 · default 8080 · Native REST API listener port."},{"title":"[server] es_compat_port","slug":"/docs/config#server","kicker":"CONFIG","snip":"u16 · default 9200 · Elasticsearch-wire-format port. 0 = OS-assigned port."},{"title":"[storage] wal_sync","slug":"/docs/config#storage","kicker":"CONFIG","snip":"enum · default batched · sync · batched · async. Durability knob."},{"title":"[vector] hnsw_ef_search","slug":"/docs/config#vector","kicker":"CONFIG","snip":"u32 · default 100 · Accepted but not wired — the beam width comes from the request num_candidates."},{"title":"[vector] default_quantization","slug":"/docs/config#vector","kicker":"CONFIG","snip":"enum · none (default) · scalar8. binary is refused at startup; scalar4 is not accepted."},{"title":"GET /v1/health","slug":"/docs/api-native#health","kicker":"NATIVE API","snip":"Liveness + readiness. {status, uptime_s, version}."},{"title":"GET /v1/metrics","slug":"/docs/api-native#metrics","kicker":"NATIVE API","snip":"Prometheus text format. Scrape-friendly."},{"title":"POST /v1/indices/:name/turbo-ingest","slug":"/docs/api-native#turbo-ingest","kicker":"NATIVE API","snip":"NDJSON bulk path with parallel tokenization."},{"title":"POST /v1/indices/:name/search","slug":"/docs/api-native#search","kicker":"NATIVE API","snip":"Unified query endpoint — full-text, term, range, KNN, hybrid."},{"title":"POST /:index/_bulk","slug":"/docs/api-es-compat#bulk","kicker":"ES API","snip":"NDJSON bulk. Actions: index, create, update, delete."},{"title":"POST /:index/_search","slug":"/docs/api-es-compat#search","kicker":"ES API","snip":"ES query DSL. Drop-in migration path."},{"title":"match_all","slug":"/docs/queries#match-all","kicker":"QUERY","snip":"Everything in the index."},{"title":"bool","slug":"/docs/queries#bool","kicker":"QUERY","snip":"must / should / must_not / filter clauses."},{"title":"knn","slug":"/docs/queries#knn","kicker":"QUERY","snip":"Vector kNN — HNSW-served when unfiltered (exact-rescored); filtered runs the exact scan."},{"title":"semantic","slug":"/docs/queries#semantic","kicker":"QUERY","snip":"Embed the query text at query time and search the vector field."},{"title":"hybrid","slug":"/docs/queries#hybrid","kicker":"QUERY","snip":"RRF / linear fusion of sub-queries."},{"title":"terms aggregation","slug":"/docs/aggregations#terms","kicker":"AGG","snip":"Exact, pre-computed terms histograms over keyword fields."},{"title":"date_histogram","slug":"/docs/aggregations#date-histogram","kicker":"AGG","snip":"Time-bucketed counts."},{"title":"kNN serving","slug":"/docs/vectors#knn-query","kicker":"VECTORS","snip":"Unfiltered kNN via persisted HNSW + exact rescore; filtered kNN exact scan."},{"title":"SQ8 quantization","slug":"/docs/vectors#quantization","kicker":"VECTORS","snip":"8-bit scalar quantization. int8 scoring precision, not a memory saving (#392)."},{"title":"turbo-ingest","slug":"/docs/ingest#turbo","kicker":"INGEST","snip":"NDJSON bulk path. Parallel tokenization across cores."},{"title":"delta-of-delta","slug":"/docs/compression#delta-of-delta","kicker":"COMPRESSION","snip":"Timestamp encoding. Apache/Nginx/ISO auto-detect."},{"title":"dictionary encoding","slug":"/docs/compression#dictionary","kicker":"COMPRESSION","snip":"Up to 256 unique strings per column."},{"title":"api_key","slug":"/docs/security#api-key","kicker":"SECURITY","snip":"Static admin key. Auto-generated on first run."},{"title":"SIEM playbook","slug":"/docs/playbooks/siem","kicker":"PLAYBOOK","snip":"Terms agg over source IPs for SIEM, with detection rules."},{"title":"RAG playbook","slug":"/docs/playbooks/vector-search","kicker":"PLAYBOOK","snip":"Embeddings, kNN, hybrid search, BM25 + kNN fusion."},{"title":"[cluster] enabled","slug":"/docs/config#cluster","kicker":"CONFIG","snip":"bool · default false · Enable multi-node Raft cluster mode."},{"title":"[cluster] peers","slug":"/docs/config#cluster","kicker":"CONFIG","snip":"array · \"host:port=host:port\" · label must equal address (#1171)."},{"title":"[cluster] port","slug":"/docs/config#cluster","kicker":"CONFIG","snip":"u16 · default 9300 · Intra-cluster Raft + search port."},{"title":"[embedding] default_endpoint","slug":"/docs/config#embedding","kicker":"CONFIG","snip":"string · OpenAI-compatible embeddings URL for auto-embedding on ingest."},{"title":"[embedding] default_model","slug":"/docs/config#embedding","kicker":"CONFIG","snip":"string · Model name (e.g. text-embedding-3-small, nomic-embed-text)."},{"title":"Raft","slug":"/docs/clustering","kicker":"CLUSTER","snip":"Embedded Raft ring — leader election, heartbeats, authenticated transport."},{"title":"Leader failover","slug":"/docs/clustering","kicker":"CLUSTER","snip":"Kill the leader of a 3-node ring: survivors elect a new leader in ~250 ms."},{"title":"Cluster honesty","slug":"/docs/clustering","kicker":"CLUSTER","snip":"What the ring does today; metadata and data replication are roadmap (#1170)."},{"title":"Systemd unit","slug":"/docs/operations","kicker":"OPS","snip":"Production unit file with hardening directives."},{"title":"Readiness probe","slug":"/docs/operations","kicker":"OPS","snip":"GET /v1/health/ready — only 200 once WAL replay is complete."},{"title":"Config reload","slug":"/docs/operations","kicker":"OPS","snip":"SIGHUP reloads most keys without restart."},{"title":"Hot backup","slug":"/docs/backup-restore","kicker":"OPS","snip":"rsync the data dir after POST /v1/admin/flush."},{"title":"S3 backup","slug":"/docs/backup-restore","kicker":"OPS","snip":"POST /v1/admin/backup → any S3-compatible endpoint."},{"title":"Cluster upgrade","slug":"/docs/upgrades","kicker":"OPS","snip":"The cluster wire has no version negotiation — full stop/start, not rolling."},{"title":"Merge pressure","slug":"/docs/troubleshooting","kicker":"OPS","snip":"Segment count climbing → raise merge.max_concurrent + io_rate."},{"title":"Cluster flapping","slug":"/docs/troubleshooting","kicker":"OPS","snip":"Sustained leader churn is a defect — capture RUST_LOG=xerj_cluster=debug and file it."},{"title":"WAL warnings after a crash","slug":"/docs/troubleshooting","kicker":"OPS","snip":"Repaired on startup; no manual repair command."},{"title": "Recipes", "slug": "/docs/recipes/", "kicker": "RECIPES", "snip": "Task-oriented AI & search recipes, each verified end-to-end against a live XERJ."},{"title": "Semantic search & RAG", "slug": "/docs/recipes/semantic-search-rag", "kicker": "RECIPE", "snip": "Retrieval by meaning with semantic_text — auto-embed on ingest, no separate vector DB."},{"title": "Agent memory", "slug": "/docs/recipes/agentic-memory", "kicker": "RECIPE", "snip": "Long-term memory for agents via /_memory — store, recall, forget, per-agent isolation."},{"title": "Passage retrieval", "slug": "/docs/recipes/passage-retrieval", "kicker": "RECIPE", "snip": "Auto-chunk long docs; best-passage (max-sim) scoring — 98% top-3."},{"title": "Vector search · kNN", "slug": "/docs/recipes/vector-search-knn", "kicker": "RECIPE", "snip": "Nearest-neighbor over dense_vector — HNSW-served unfiltered, exact with filters."},{"title": "Vector quantization", "slug": "/docs/recipes/vector-quantization", "kicker": "RECIPE", "snip": "scalar8 (accepts ES int8_hnsw; exact code scan) — int8 scoring at recall@10 = 0.998. Precision, not memory."},{"title": "Hybrid search", "slug": "/docs/recipes/hybrid-search", "kicker": "RECIPE", "snip": "Keyword + vector in one query — RRF fusion."},{"title": "Log analytics", "slug": "/docs/recipes/log-analytics", "kicker": "RECIPE", "snip": "Raw logs to dashboards — error rates, p95 latency, top services."},{"title": "Anomaly detection", "slug": "/docs/recipes/anomaly-detection", "kicker": "RECIPE", "snip": "Statistical _ml detectors that flag spikes in metrics/logs."},{"title": "Anomaly datafeeds", "slug": "/docs/recipes/continuous-anomaly-datafeeds", "kicker": "RECIPE", "snip": "Live _ml datafeed re-scores an index on a timer, stores anomaly records."},{"title": "Migrate from ES", "slug": "/docs/recipes/migrate-from-elasticsearch", "kicker": "RECIPE", "snip": "Point your existing ES client at XERJ — same wire, change the URL."}]</script>
 
 <script>
   // IIFE — js-auth navigates between decrypted pages in the same
