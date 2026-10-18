@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use xerj_common::hub::{
     render, Answer, CatalogueEntry, LicenceClass, PackIndex, PackManifest, PackSource,
@@ -49,6 +50,10 @@ const HUB_USAGE: &str = "usage: xerj hub <command>
 
   build-pack <slug> --registry <dir> --out <dir> --url <node> --sign-key <seed-file>
         Build a signed, pre-indexed pack from a registry manifest (CI).
+  build-pack <slug> --from-pack <dir> --out <dir> --url <node> --sign-key <seed-file>
+        The same, from a record pack `xerj corpus build` made (rust-vulns,
+        agent-session-trajectories): its pin is the first 40 hex of a sha256
+        over its record files, so the same records give the same pin.
   build-catalogue --registry <dir> --packs <dir> --out <file> --sign-key <seed-file>
         Build and sign the catalogue from verified packs (CI; see -h).
   sync [--url <node>] | sync --install-timer
@@ -122,6 +127,7 @@ pub fn run_hub_cli(args: &[String]) -> i32 {
 fn run_build_pack(args: &[String]) -> i32 {
     let mut slug: Option<String> = None;
     let mut registry: Option<String> = None;
+    let mut from_pack: Option<String> = None;
     let mut out: Option<String> = None;
     let mut url: Option<String> = None;
     let mut sign_key: Option<String> = None;
@@ -147,6 +153,7 @@ fn run_build_pack(args: &[String]) -> i32 {
                 return 0;
             }
             "--registry" => registry = Some(val!("--registry")),
+            "--from-pack" => from_pack = Some(val!("--from-pack")),
             "--out" => out = Some(val!("--out")),
             "--url" => url = Some(val!("--url")),
             "--sign-key" => sign_key = Some(val!("--sign-key")),
@@ -169,16 +176,32 @@ fn run_build_pack(args: &[String]) -> i32 {
     // It must never fall through to resolve_url's localhost:9200 default — the
     // builder clones + indexes + snapshots into the node it is handed, and a
     // silent default would mutate whatever shared node happens to answer there.
-    let (Some(slug), Some(registry), Some(out), Some(sign_key), Some(url)) =
-        (slug, registry, out, sign_key, url)
-    else {
+    let source = match (registry, from_pack) {
+        (Some(r), None) => BuildSource::Registry(r),
+        (None, Some(p)) => BuildSource::RecordPack(p),
+        (Some(_), Some(_)) => {
+            eprintln!(
+                "xerj hub build-pack: --registry and --from-pack name two different sources; \
+                 pass one\n\n{HUB_USAGE}"
+            );
+            return 2;
+        }
+        (None, None) => {
+            eprintln!(
+                "xerj hub build-pack: <slug>, --registry (or --from-pack), --out, --url and \
+                 --sign-key are all required\n\n{HUB_USAGE}"
+            );
+            return 2;
+        }
+    };
+    let (Some(slug), Some(out), Some(sign_key), Some(url)) = (slug, out, sign_key, url) else {
         eprintln!(
-            "xerj hub build-pack: <slug>, --registry, --out, --url and --sign-key are all \
-             required\n\n{HUB_USAGE}"
+            "xerj hub build-pack: <slug>, --registry (or --from-pack), --out, --url and \
+             --sign-key are all required\n\n{HUB_USAGE}"
         );
         return 2;
     };
-    match build_pack(&slug, &registry, &out, &url, &sign_key) {
+    match build_pack(&slug, &source, &out, &url, &sign_key) {
         Ok(summary) => {
             println!("{summary}");
             0
@@ -192,9 +215,17 @@ fn run_build_pack(args: &[String]) -> i32 {
 
 /// Build the pack and return the one-line summary `pack <slug> <pin8> <bytes>
 /// <indices> <defs>` (plan §2 step 6).
+/// What `build-pack` builds from.
+enum BuildSource {
+    /// `--registry <dir>`: the git manifest `<dir>/<slug>.json`.
+    Registry(String),
+    /// `--from-pack <dir>`: a record pack (`xerj corpus build` output).
+    RecordPack(String),
+}
+
 fn build_pack(
     slug: &str,
-    registry: &str,
+    source: &BuildSource,
     out: &str,
     url: &str,
     sign_key_file: &str,
@@ -203,25 +234,38 @@ fn build_pack(
         .with_context(|| format!("read sign key {sign_key_file}"))?
         .trim()
         .to_string();
-    let manifest_path = Path::new(registry).join(format!("{slug}.json"));
-    if !manifest_path.is_file() {
-        bail!("no registry manifest at {}", manifest_path.display());
-    }
 
     // 1. Licence, pin and sources — from the EXISTING parsers (no second parser
     //    for the registry manifest, plan §11): `read_hub_manifest` for the
     //    per-repo sources, and the catalogue builder for the restrictive-first
-    //    licence class + pin date it already computes.
-    let meta = resolve_pack_metadata(&manifest_path, &seed)
-        .with_context(|| format!("read licence/pin from {}", manifest_path.display()))?;
+    //    licence class + pin date it already computes. A record pack's come from
+    //    its own verified manifest (`harvest::pack::read_manifest`).
+    let (meta, add_from) = match source {
+        BuildSource::Registry(registry) => {
+            let manifest_path = Path::new(registry).join(format!("{slug}.json"));
+            if !manifest_path.is_file() {
+                bail!("no registry manifest at {}", manifest_path.display());
+            }
+            let meta = resolve_pack_metadata(&manifest_path, &seed)
+                .with_context(|| format!("read licence/pin from {}", manifest_path.display()))?;
+            (meta, manifest_path)
+        }
+        BuildSource::RecordPack(dir) => {
+            let dir = PathBuf::from(dir);
+            let meta = record_pack_metadata(&dir, slug)
+                .with_context(|| format!("read record pack {}", dir.display()))?;
+            (meta, dir)
+        }
+    };
     let pin8 = pin8_of(&meta.pin_sha)?;
 
-    // 2. Clone + index into the builder node (the SAME lifecycle the CLI runs).
+    // 2. Clone (or materialize the records) + index into the builder node (the
+    //    SAME lifecycle the CLI runs).
     let rc = xerj_autoindex::xc::run_corpus_cli(&[
         "add".into(),
         slug.into(),
         "--from".into(),
-        manifest_path.to_string_lossy().into_owned(),
+        add_from.to_string_lossy().into_owned(),
     ]);
     if rc != 0 {
         bail!("`corpus add` failed (exit {rc})");
@@ -253,8 +297,11 @@ fn build_pack(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| overall_licence.clone())
     };
-    let (defs, files) = pack::build_defs_and_files(&corpus_root, &licence_of)
-        .with_context(|| format!("extract defs from {}", corpus_root.display()))?;
+    let (defs, files) = match source {
+        BuildSource::Registry(_) => pack::build_defs_and_files(&corpus_root, &licence_of),
+        BuildSource::RecordPack(_) => pack::record_defs_and_files(&corpus_root, &licence_of),
+    }
+    .with_context(|| format!("extract defs from {}", corpus_root.display()))?;
 
     // 4. Build + index the `-defs` index (plan §3 mapping) on the builder node.
     let node = HubNode::connect_with_key(url, None)?;
@@ -369,6 +416,95 @@ fn resolve_pack_metadata(manifest_path: &Path, seed: &str) -> Result<PackMetadat
         licence_spdx: entry.licence_spdx.clone(),
         licence_class: entry.licence_class,
         sources,
+    })
+}
+
+/// Pack metadata for a record pack (`xerj corpus build` output), from its own
+/// manifest after `harvest::pack::read_manifest` has re-hashed every file
+/// SHA256SUMS names.
+///
+/// - pin: a record pack has no commit, so its pin is a CONTENT pin: the first
+///   40 hex of sha256 over `"<file>  <sha256>\n"` for each record file, in name
+///   order. The same records give the same pin whatever the build date, and a
+///   changed record gives a new one (the hub's release-per-pin rule then
+///   applies unchanged). 40 hex keeps every pin the same shape.
+/// - pin_date: the pack's `created_at` date.
+/// - licence: each source's recorded SPDX; the class from the repo's one
+///   licence policy (`xccode::licence::is_restricted`, which also counts
+///   UNKNOWN as restricted). A source with no licence is refused.
+fn record_pack_metadata(dir: &Path, slug: &str) -> Result<PackMetadata> {
+    let meta = xerj_autoindex::harvest::pack::read_manifest(dir)?;
+    if meta.name != slug {
+        bail!("the pack is '{}', not '{slug}'", meta.name);
+    }
+    let raw: Value = serde_json::from_str(
+        &fs::read_to_string(dir.join("manifest.json")).context("read manifest.json")?,
+    )
+    .context("parse manifest.json")?;
+    let mut listing = String::new();
+    for f in &meta.files {
+        // read_manifest checked each of these is 64 hex and matches the bytes.
+        let sha = raw
+            .pointer(&format!(
+                "/files/{}/sha256",
+                f.name.replace('~', "~0").replace('/', "~1")
+            ))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("manifest.json lists no sha256 for {}", f.name))?;
+        listing.push_str(&format!("{}  {sha}\n", f.name));
+    }
+    if meta.files.is_empty() {
+        bail!("the pack has no record files");
+    }
+    let digest = Sha256::digest(listing.as_bytes());
+    let pin_sha: String = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()[..40]
+        .to_string();
+    let pin_date = raw
+        .get("created_at")
+        .and_then(Value::as_str)
+        .and_then(|c| c.get(0..10))
+        .ok_or_else(|| anyhow!("manifest.json has no created_at date"))?
+        .to_string();
+
+    let mut spdx: Vec<String> = Vec::new();
+    for s in &meta.sources {
+        let lic = s.licence.trim();
+        if lic.is_empty() {
+            bail!("source '{}' records no licence", s.slug);
+        }
+        if !spdx.iter().any(|l| l == lic) {
+            spdx.push(lic.to_string());
+        }
+    }
+    if spdx.is_empty() {
+        bail!("the pack declares no sources");
+    }
+    let licence_class = if spdx
+        .iter()
+        .any(|l| xerj_common::xccode::licence::is_restricted(l))
+    {
+        LicenceClass::ApproachOnly
+    } else {
+        LicenceClass::AdaptWithAttribution
+    };
+    Ok(PackMetadata {
+        pin_sha,
+        pin_date,
+        licence_spdx: spdx.join("/"),
+        licence_class,
+        sources: meta
+            .sources
+            .iter()
+            .map(|s| PackSource {
+                repo: s.slug.clone(),
+                url: s.url.clone().unwrap_or_default(),
+                sha: s.watermark.clone().unwrap_or_default(),
+                licence: s.licence.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -1439,6 +1575,121 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal record pack in the layout `xerj corpus build` writes and
+    /// `harvest::pack::read_manifest` verifies.
+    fn record_pack(dir: &Path, slug: &str, created_at: &str, records: &str, licence: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let hex = |b: &[u8]| -> String {
+            Sha256::digest(b)
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect()
+        };
+        fs::write(dir.join("records-000.jsonl"), records).unwrap();
+        fs::write(dir.join("recipe.toml"), "[recipe]\n").unwrap();
+        let n = records.lines().filter(|l| !l.trim().is_empty()).count();
+        let manifest = json!({
+            "format_version": 1, "kind": "harvested", "pack": slug,
+            "created_at": created_at, "generation": 3,
+            "counts": { "records": n },
+            "files": { "records-000.jsonl": { "sha256": hex(records.as_bytes()), "records": n } },
+            "sources": [ { "slug": "src", "licence": licence, "url": "https://x.test/src" } ],
+        });
+        let manifest = serde_json::to_string_pretty(&manifest).unwrap();
+        fs::write(dir.join("manifest.json"), &manifest).unwrap();
+        let sums = format!(
+            "{}  manifest.json\n{}  recipe.toml\n{}  records-000.jsonl\n",
+            hex(manifest.as_bytes()),
+            hex(b"[recipe]\n"),
+            hex(records.as_bytes())
+        );
+        fs::write(dir.join("SHA256SUMS"), sums).unwrap();
+    }
+
+    const RECORDS: &str = "{\"id\":\"A-1\",\"source\":\"src\"}\n";
+
+    #[test]
+    fn a_record_packs_pin_is_its_content_not_its_build_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            tmp.path().join("a"),
+            tmp.path().join("b"),
+            tmp.path().join("c"),
+        );
+        record_pack(&a, "rv", "2026-10-16T04:23:00Z", RECORDS, "CC0-1.0");
+        record_pack(&b, "rv", "2026-10-17T04:23:00Z", RECORDS, "CC0-1.0");
+        record_pack(
+            &c,
+            "rv",
+            "2026-10-17T04:23:00Z",
+            "{\"id\":\"A-2\",\"source\":\"src\"}\n",
+            "CC0-1.0",
+        );
+        let ma = record_pack_metadata(&a, "rv").unwrap();
+        let mb = record_pack_metadata(&b, "rv").unwrap();
+        let mc = record_pack_metadata(&c, "rv").unwrap();
+        assert_eq!(ma.pin_sha.len(), 40);
+        assert!(ma.pin_sha.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(ma.pin_sha, mb.pin_sha, "same records, same pin");
+        assert_ne!(mb.pin_sha, mc.pin_sha, "a changed record moves the pin");
+        assert_eq!(ma.pin_date, "2026-10-16");
+        assert_eq!(mb.pin_date, "2026-10-17");
+        assert_eq!(ma.licence_spdx, "CC0-1.0");
+        assert_eq!(ma.licence_class, LicenceClass::AdaptWithAttribution);
+        assert_eq!(ma.sources.len(), 1);
+        assert_eq!(ma.sources[0].repo, "src");
+        assert_eq!(ma.sources[0].url, "https://x.test/src");
+    }
+
+    #[test]
+    fn a_record_packs_licence_follows_the_one_licence_policy_and_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gpl = tmp.path().join("gpl");
+        record_pack(&gpl, "rv", "2026-10-16T00:00:00Z", RECORDS, "GPL-3.0");
+        let m = record_pack_metadata(&gpl, "rv").unwrap();
+        assert_eq!(m.licence_class, LicenceClass::ApproachOnly);
+        let none = tmp.path().join("none");
+        record_pack(&none, "rv", "2026-10-16T00:00:00Z", RECORDS, "");
+        let err = format!("{:#}", record_pack_metadata(&none, "rv").err().unwrap());
+        assert!(err.contains("records no licence"), "{err}");
+    }
+
+    #[test]
+    fn a_record_pack_for_another_slug_or_a_tampered_one_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        record_pack(&dir, "rv", "2026-10-16T00:00:00Z", RECORDS, "CC0-1.0");
+        let err = format!("{:#}", record_pack_metadata(&dir, "other").err().unwrap());
+        assert!(err.contains("not 'other'"), "{err}");
+        fs::write(
+            dir.join("records-000.jsonl"),
+            "{\"id\":\"B\",\"source\":\"src\"}\n",
+        )
+        .unwrap();
+        assert!(record_pack_metadata(&dir, "rv").is_err());
+    }
+
+    #[test]
+    fn build_pack_takes_one_source_not_two() {
+        let args: Vec<String> = [
+            "rv",
+            "--registry",
+            "r",
+            "--from-pack",
+            "p",
+            "--out",
+            "o",
+            "--url",
+            "http://127.0.0.1:1",
+            "--sign-key",
+            "k",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(run_build_pack(&args), 2);
+    }
 
     #[test]
     fn pin8_takes_eight_lowercase_hex() {

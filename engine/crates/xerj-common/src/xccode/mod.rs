@@ -222,14 +222,39 @@ pub fn run_code_query(
     //    "no match" is the state-ledger trust trap this guard closes.
     //    An unreachable node is reported honestly (exit 2) by the search
     //    path below, never as "0 live indices".
-    match http.cat_indices_json(&format!("{prefix}*")) {
-        Ok(indices) if indices.is_empty() => {
-            return CodeOutcome::refused(state::not_loaded_message(&st, &prefix, url), 3)
+    // A hub pack carries a `<prefix>-defs` index ALONGSIDE the document
+    // indices: a symbol table queried only by the `--def` path (`xerj-hub`'s
+    // `def::lookup`, which names `<prefix>-defs` directly). It is NOT a
+    // passage index — its records are `symbol -> file:line`, mapped on a
+    // disjoint field set (`symbol_text`, `text`) that the document indices do
+    // not carry. Leaving it inside the `{prefix}*` glob the passage search
+    // uses has two failure modes, both measured on a restored record pack:
+    //  * field resolution reads its `text`/`symbol_text` into the multi_match,
+    //    and because the document indices do not map them the whole multi-
+    //    index query hits the silent-zero (the MULTIMATCH_DEFECT) and returns
+    //    nothing for a word that is plainly in a document's `body`;
+    //  * even when it does match, a synthetic def record wins slots that
+    //    belong to real passages.
+    // So the passage path EXCLUDES it — `{prefix}*,-{prefix}-defs` — while the
+    // `--def` path keeps querying it directly. The exclusion is added only
+    // when the index is actually present (a plain `xerj corpus index` corpus
+    // has none, and `GET /{prefix}*,-{prefix}-defs/_mapping` is an
+    // `index_not_found_exception` when the excluded name does not exist).
+    let indices = http.cat_indices_json(&format!("{prefix}*"));
+    if let Ok(ref list) = indices {
+        if list.is_empty() {
+            return CodeOutcome::refused(state::not_loaded_message(&st, &prefix, url), 3);
         }
-        // Unreachable/ambiguous: fall through; the search itself will report
-        // the transport failure honestly.
-        _ => {}
     }
+    // Unreachable/ambiguous (Err): fall through; the search itself reports the
+    // transport failure honestly.
+    let defs_index = format!("{prefix}-defs");
+    let pattern = match &indices {
+        Ok(list) if list.iter().any(|i| i == &defs_index) => {
+            format!("{prefix}*,-{defs_index}")
+        }
+        _ => format!("{prefix}*"),
+    };
 
     let mut warnings = Vec::new();
     if let Some(w) = state::incomplete_coverage(&st) {
@@ -239,7 +264,6 @@ pub fn run_code_query(
     // 4. Mapping: one read serves both field resolution and capable-set
     //    discovery. Unreadable is data, not an error (bm25 degrades to the
     //    full field list; hybrid degrades to BM25-only).
-    let pattern = format!("{prefix}*");
     let mapping = http.get_mapping(&format!("/{pattern}/_mapping")).ok();
     let mut fields = fields::resolve_fields(mapping.as_ref());
     if fields.is_empty() {
@@ -1297,6 +1321,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_hub_pack_defs_index_is_excluded_from_the_passage_search() {
+        let root = root_with_state();
+        let mut http = FakeHttp::new();
+        // A restored hub pack: the document index AND the `-defs` symbol table
+        // are both live under the prefix.
+        http.live = vec!["xc-kv-b1-000".to_string(), "xc-kv-b1-defs".to_string()];
+        let out = run_code_query(
+            &root,
+            &http,
+            "http://localhost:9200",
+            &CodeParams::new("kv", "addReplyNull"),
+            "`--stale-ok`",
+        );
+        assert_eq!(out.exit, 0);
+        // The passage search names the exclusion so a def record can never be
+        // ranked as a passage, and so the defs-only `symbol_text`/`text`
+        // mapping can never silent-zero the multi_match (the MULTIMATCH_DEFECT).
+        for (idx, _) in http.searches.lock().unwrap().iter() {
+            assert_eq!(
+                idx, "xc-kv-b1*,-xc-kv-b1-defs",
+                "every passage search excludes the `-defs` index"
+            );
+        }
+    }
+
     fn root_with_state() -> std::path::PathBuf {
         let root = tempfile::tempdir().unwrap().keep();
         std::fs::create_dir_all(root.join("state")).unwrap();
@@ -1345,6 +1395,10 @@ mod tests {
             }),
             "mapping-resolved fields (defs_expanded dropped); no highlight, no _source \
              projection; size is the #1137 diversity fetch (10x k=5), cut back to k after"
+        );
+        assert!(
+            http.searches.lock().unwrap()[0].0.find('*').is_some(),
+            "no `-defs` index is live here, so the plain glob is used unchanged"
         );
         assert!(out
             .text

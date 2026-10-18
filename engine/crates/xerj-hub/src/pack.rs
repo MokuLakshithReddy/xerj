@@ -453,6 +453,119 @@ pub fn build_defs_and_files(
     Ok((defs, files))
 }
 
+/// [`build_defs_and_files`] for a RECORD corpus (a record pack `xerj corpus add`
+/// materialized as `<source>/records.jsonl`, one canonical JSON record per
+/// line). A record pack has no source code to parse; its definitions are what
+/// its recipe declares:
+///
+/// - every record is one definition of its `id` (kind `record`), so
+///   `--def RUSTSEC-2021-0003` or `--def GHSA-…` lands on the line holding it;
+/// - every identifier the recipe's `defs_from` put in the record's `defs` field
+///   (rust-vulns: the advisory's affected functions, `smallvec::SmallVec::insert_many`)
+///   is a definition of kind `record_def` at the same line. Only tokens shaped
+///   like identifiers or paths count; `defs` is space-joined, so free text a
+///   recipe routed there splits into words, and words are not definitions.
+///
+/// `file` is the records file and `line` the record's 1-based line in it, so a
+/// hit opens at the record. The inventory lists each records file.
+pub fn record_defs_and_files(
+    corpus_root: &Path,
+    licence_of: &dyn Fn(&str) -> String,
+) -> Result<(Vec<DefRecord>, Vec<PackFileEntry>)> {
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    walk_corpus(corpus_root, corpus_root, &mut found)?;
+    let mut defs: Vec<DefRecord> = Vec::new();
+    let mut files: Vec<PackFileEntry> = Vec::new();
+    for (rel, abs) in &found {
+        if rel == "corpus.json" {
+            continue;
+        }
+        let bytes = fs::metadata(abs).map(|m| m.len()).unwrap_or(0);
+        files.push(PackFileEntry {
+            path: rel.clone(),
+            lang: String::new(),
+            bytes,
+            licence: licence_of(rel),
+        });
+        if !rel.ends_with("/records.jsonl") {
+            continue;
+        }
+        let text = fs::read_to_string(abs).with_context(|| format!("read {rel}"))?;
+        for (n, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(line)
+                .with_context(|| format!("{rel} line {}: not JSON", n + 1))?;
+            let field = |k: &str| v.get(k).and_then(serde_json::Value::as_str).unwrap_or("");
+            let id = field("id").trim();
+            if id.is_empty() {
+                continue;
+            }
+            let title = field("title").trim();
+            let line_no = u32::try_from(n + 1).unwrap_or(u32::MAX);
+            let summary = if title.is_empty() || title == id {
+                id.to_string()
+            } else {
+                format!("{id}: {title}")
+            };
+            let summary = truncate_chars(&summary, 400);
+            defs.push(DefRecord {
+                symbol: id.to_string(),
+                kind: "record".into(),
+                lang: String::new(),
+                file: rel.clone(),
+                line: line_no,
+                text: summary.clone(),
+                value: None,
+            });
+            let mut seen: Vec<&str> = vec![id];
+            for tok in field("defs").split_whitespace() {
+                if is_symbol_token(tok) && !seen.contains(&tok) {
+                    seen.push(tok);
+                    defs.push(DefRecord {
+                        symbol: tok.to_string(),
+                        kind: "record_def".into(),
+                        lang: String::new(),
+                        file: rel.clone(),
+                        line: line_no,
+                        text: summary.clone(),
+                        value: None,
+                    });
+                }
+            }
+        }
+    }
+    defs.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.line.cmp(&b.line))
+            .then(a.symbol.cmp(&b.symbol))
+    });
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((defs, files))
+}
+
+/// An identifier (`insert_many`) or a `::`/`.`-separated path of identifiers
+/// (`smallvec::SmallVec::insert_many`, `os.path.join`), at most 200 bytes.
+fn is_symbol_token(tok: &str) -> bool {
+    if tok.is_empty() || tok.len() > 200 {
+        return false;
+    }
+    tok.split("::").flat_map(|p| p.split('.')).all(|part| {
+        let mut chars = part.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => s[..i].to_string(),
+        None => s.to_string(),
+    }
+}
+
 /// Recursively collect regular files as `(relative-forward-slash path, abs)`,
 /// skipping `.git`. Mirrors the snapshot walker but keyed on a corpus root.
 fn walk_corpus(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {

@@ -646,6 +646,86 @@ class CatalogueTests(unittest.TestCase):
         self.assertIn("1 of 2 live corpora", out.stderr)
 
 
+class RecordPackTests(unittest.TestCase):
+    """Live lane-B corpora (record packs) as hubpacks: no manifest, a content pin."""
+
+    REPO = "xerj-org/xerj"
+    PIN = "0123abcd" + "e" * 32
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        rows = [row("alpha"), row("rust-vulns", lane="B", refresh="daily"),
+                row("old-records", status="candidate", lane="B")]
+        mans = {"alpha": manifest_text("alpha", [("alpha", "https://x.test/a", SHA_A)])}
+        self.reg, self.backlog = write_registry(self.root, rows, mans)
+        self.corpora, _ = hp.load_live(self.reg, self.backlog)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_only_live_lane_b_rows_are_record_corpora(self):
+        self.assertEqual(hp.load_record_slugs(self.backlog), ["rust-vulns"])
+
+    def test_record_fetch_list_ignores_the_dated_json_releases(self):
+        tags = ["pack-rust-vulns-2026-10-08", "pack-rust-vulns-2026-10-08-r2",
+                "pack-rust-vulns-0123abcd", "pack-rust-vulns-0123abcd-r2", "pack-rust-vulns-99999999",
+                "pack-rust-vulns-x-0123abcd"]
+        self.assertEqual(
+            hp.record_fetch_list(["rust-vulns"], tags),
+            [("rust-vulns", "0123abcd", "pack-rust-vulns-0123abcd-r2"), ("rust-vulns", "99999999", "pack-rust-vulns-99999999")],
+        )
+        newest = {"pack-rust-vulns-0123abcd-r2": "2026-10-17T04:30:00Z", "pack-rust-vulns-99999999": "2026-10-16T04:30:00Z"}
+        self.assertEqual(
+            hp.record_fetch_list(["rust-vulns"], tags, newest),
+            [("rust-vulns", "0123abcd", "pack-rust-vulns-0123abcd-r2")],
+        )
+        self.assertEqual(hp.record_fetch_list(["rust-vulns"], ["pack-rust-vulns-2026-10-08"]), [])
+
+    def test_fetch_list_command_adds_the_record_packs(self):
+        tags = self.root / "tags.txt"
+        tags.write_text("pack-alpha-aaaaaaaa\npack-rust-vulns-2026-10-08\npack-rust-vulns-0123abcd\npack-rust-vulns-11111111\n")
+        at = self.root / "at.tsv"
+        at.write_text("pack-rust-vulns-0123abcd\t2026-10-17T00:00:00Z\npack-rust-vulns-11111111\t2026-10-16T00:00:00Z\n")
+        out = subprocess.run(
+            [sys.executable, hp.__file__, "fetch-list", "--registry", str(self.reg), "--backlog", str(self.backlog),
+             "--published-tags", str(tags), "--published-at", str(at)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "alpha\taaaaaaaa\tpack-alpha-aaaaaaaa\nrust-vulns\t0123abcd\tpack-rust-vulns-0123abcd\n")
+
+    def entry(self, slug: str, sha: str, tag_pin8: str = "") -> dict:
+        pin8 = tag_pin8 or sha[:8]
+        url = (f"https://github.com/{self.REPO}/releases/download/pack-{slug}-{pin8}/"
+               f"{slug}-{pin8}.hubpack.tar.zst")
+        return {"slug": slug, "pin_sha": sha, "pack_url": url, "sig_url": url + ".sig",
+                "pack_sha256": "ab" * 32, "pack_bytes": 1}
+
+    def cat(self, *entries: dict) -> bytes:
+        return json.dumps({"format_version": 1, "generated_at": "x", "corpora": list(entries)}).encode()
+
+    def check(self, raw: bytes, previous=None) -> list[str]:
+        return hp.check_catalogue(raw, self.corpora, self.REPO, previous, hp.load_record_slugs(self.backlog))
+
+    def test_a_record_entry_with_its_own_pin_passes(self):
+        self.assertEqual(self.check(self.cat(self.entry("alpha", SHA_A), self.entry("rust-vulns", self.PIN))), [])
+
+    def test_a_record_entry_must_name_its_pin_in_the_url_and_be_live(self):
+        joined = "\n".join(self.check(self.cat(
+            self.entry("rust-vulns", self.PIN, tag_pin8="99999999"),
+            self.entry("old-records", self.PIN),
+        )))
+        self.assertIn("rust-vulns: pack_url", joined)
+        self.assertIn("old-records: not a live lane-A corpus", joined)
+        self.assertIn("is not 40 hex", "\n".join(self.check(self.cat(self.entry("rust-vulns", "0123abcd")))))
+
+    def test_a_live_record_corpus_may_not_vanish(self):
+        live = self.cat(self.entry("alpha", SHA_A), self.entry("rust-vulns", self.PIN))
+        errors = self.check(self.cat(self.entry("alpha", SHA_A)), previous=live)
+        self.assertEqual(errors, ["rust-vulns: in the live catalogue and still live, but missing from the new one"])
+
+
 class ReportTests(unittest.TestCase):
     STAGES = ["start", "build", "verify", "tag", "upload", "e2e", "publish"]
 

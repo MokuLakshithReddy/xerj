@@ -91,9 +91,14 @@ done
 "$BIN" hub pull "$SLUG" || fail "xerj hub pull $SLUG failed (exit $?)"
 
 # 4. --def for a symbol from the pack's own defs.jsonl: the first identifier of
-#    four or more characters (a stable, deterministic choice).
+#    four or more characters (a stable, deterministic choice). A record pack
+#    (build-pack --from-pack) may have none: its definitions are record ids
+#    (RUSTSEC-2021-0003, nst-…) and paths (smallvec::SmallVec::insert_many), so
+#    the first such symbol is the fallback.
 zstd -dc "$WORK/rel/$TAG/$FILE" | tar -xOf - defs.jsonl > "$WORK/defs.jsonl"
 DEF=$(jq -cn 'first(inputs | select(.symbol | test("^[A-Za-z_][A-Za-z0-9_]{3,}$"))) // empty' \
+      "$WORK/defs.jsonl")
+[ -n "$DEF" ] || DEF=$(jq -cn 'first(inputs | select(.symbol | test("^[A-Za-z0-9_][A-Za-z0-9_:.-]{3,}$"))) // empty' \
       "$WORK/defs.jsonl")
 [ -n "$DEF" ] || fail "defs.jsonl has no identifier to look up"
 SYM=$(jq -r .symbol <<<"$DEF")
@@ -117,14 +122,20 @@ WORDS=$(tr -cs 'A-Za-z' '\n' <<<"$ASK" | tr 'A-Z' 'a-z' | awk 'length >= 4' \
         | grep -vxE 'agent|agents|working|needing|queries|query|this|that|with|from|when|into|their|about|does' \
         | awk '{ print length, $0 }' | sort -rn -k1,1 -s | cut -d' ' -f2 | awk '!seen[$0]++' | head -n 3 || true)
 [ -n "$WORDS" ] || WORDS=$SLUG
+# A located hit: code hits carry a file/path AND a line (passage-level), the
+# stricter primary check; a RECORD corpus (rust-vulns, agent-session-
+# trajectories) has no lines — its records are addressed by `ax_path`
+# (dataset/records.jsonl), the provenance every XERJ hit carries — so a hit
+# located by a non-empty `ax_path` also counts. The filter is shared by the
+# test and the echo so they never disagree.
+LOCATED='[.. | objects | select(((.file? // .path? // "") != "" and (.line? // .start_line? // null) != null) or (.ax_path? // "") != "")]'
 hit=""
 for w in $WORDS; do
   if "$BIN" code "$SLUG" "$w" --json > "$WORK/q.json" 2> "$WORK/q.err" \
-     && jq -e '[.. | objects | select((.file? // .path? // "") != "" and (.line? // .start_line? // null) != null)] | length > 0' \
-          "$WORK/q.json" >/dev/null 2>&1; then
+     && jq -e "$LOCATED | length > 0" "$WORK/q.json" >/dev/null 2>&1; then
     hit=$w; break
   fi
 done
-[ -n "$hit" ] || { cat "$WORK/q.json" "$WORK/q.err" 2>/dev/null | head -c 4000; fail "no question from ask_for ($WORDS) returned a file:line hit"; }
-echo "question ok: \"$hit\" -> $(jq -r '[.. | objects | select((.file? // .path? // "") != "" and (.line? // .start_line? // null) != null)][0] | "\(.file // .path):\(.line // .start_line)"' "$WORK/q.json")"
+[ -n "$hit" ] || { cat "$WORK/q.json" "$WORK/q.err" 2>/dev/null | head -c 4000; fail "no question from ask_for ($WORDS) returned a located hit"; }
+echo "question ok: \"$hit\" -> $(jq -r "$LOCATED"'[0] | (.file // .path // .ax_path) + (if (.line // .start_line) then ":" + ((.line // .start_line) | tostring) else "" end)' "$WORK/q.json")"
 echo "consumer e2e passed for $SLUG @ $PIN8"

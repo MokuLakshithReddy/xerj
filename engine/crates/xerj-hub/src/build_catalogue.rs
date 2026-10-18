@@ -17,6 +17,11 @@
 //! is not the private half of [`xerj_common::hub::HUB_PUBKEY_HEX`] fails here
 //! instead of publishing a catalogue no client can load.
 //!
+//! Live lane-B corpora (record packs, `build-pack --from-pack`) have no
+//! registry manifest and no commit pin: their entry comes from the backlog row
+//! and the pack's own signed `pack.json`, and their current pin is the newest
+//! verified pack for the slug in `--packs` (see [`record_entries`]).
+//!
 //! `quality_grade` is left `None`: the plan sources it only from the graded G7
 //! files, and the field's contract is "never invent one".
 
@@ -29,8 +34,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use xerj_autoindex::harvest::sign::verify_bytes;
-use xerj_common::hub::{Catalogue, DefRecord, PackManifest, PACK_FORMAT_VERSION};
+use xerj_autoindex::harvest::sign::{sign_bytes, verify_bytes};
+use xerj_common::hub::{
+    Catalogue, CatalogueEntry, DefRecord, LicenceClass, PackManifest, PACK_FORMAT_VERSION,
+};
 
 use crate::catalogue::{build_catalogue, canonical_json, CorpusBuildInput};
 use crate::pack::PackFileEntry;
@@ -358,7 +365,8 @@ pub fn build(opts: &Options, seed_hex: &str, pubkey_hex: &str) -> Result<Built> 
             ask_for: backlog_domain.to_string(),
         });
     }
-    if inputs.is_empty() {
+    let records = record_entries(opts, rows, pubkey_hex, &mut used, &mut without_pack)?;
+    if inputs.is_empty() && records.is_empty() {
         bail!(
             "no live corpus has a pack for its current pin in {}",
             opts.packs.display()
@@ -376,7 +384,12 @@ pub fn build(opts: &Options, seed_hex: &str, pubkey_hex: &str) -> Result<Built> 
     }
     unmatched.sort();
 
-    let (catalogue, sig_hex) = build_catalogue(&inputs, &opts.generated_at, seed_hex)?;
+    let (mut catalogue, mut sig_hex) = build_catalogue(&inputs, &opts.generated_at, seed_hex)?;
+    if !records.is_empty() {
+        catalogue.corpora.extend(records);
+        catalogue.corpora.sort_by(|a, b| a.slug.cmp(&b.slug));
+        sig_hex = sign_bytes(&canonical_json(&catalogue)?, seed_hex).context("sign catalogue")?;
+    }
     let bytes = canonical_json(&catalogue)?;
     verify_bytes(&bytes, &sig_hex, pubkey_hex).context(
         "the catalogue's signature does not verify under the hub key this build embeds: the \
@@ -389,6 +402,135 @@ pub fn build(opts: &Options, seed_hex: &str, pubkey_hex: &str) -> Result<Built> 
         without_pack,
         unmatched,
     })
+}
+
+/// One entry per LIVE lane-B corpus (a record pack built by `hub build-pack
+/// --from-pack`) with a pack in `--packs`. A record pack's pin is a content
+/// pin, not a registry fact, so its current pack is the newest one for the
+/// slug in `--packs` (by `pack.json` `built_at`); the catalogue job downloads
+/// the record packs' published releases for it to choose from. Every candidate
+/// is verified like a lane-A pack; a failure aborts. Fields: slug, pin, licence
+/// and sources from the signed `pack.json`; domain, refresh, `ask_for` and
+/// `topics` from the backlog row.
+fn record_entries(
+    opts: &Options,
+    rows: &[Value],
+    pubkey_hex: &str,
+    used: &mut HashSet<String>,
+    without_pack: &mut Vec<String>,
+) -> Result<Vec<CatalogueEntry>> {
+    let mut names: Vec<String> = Vec::new();
+    for entry in
+        fs::read_dir(&opts.packs).with_context(|| format!("list {}", opts.packs.display()))?
+    {
+        names.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    let mut out = Vec::new();
+    for row in rows {
+        let field = |k: &str| row.get(k).and_then(Value::as_str).unwrap_or("");
+        if field("status") != "live" || field("lane") != "B" {
+            continue;
+        }
+        let slug = field("slug");
+        let mut best: Option<(String, PackFacts)> = None;
+        for name in &names {
+            let Some(pin8) = name
+                .strip_prefix(&format!("{slug}-"))
+                .and_then(|r| r.strip_suffix(".hubpack.tar.zst"))
+            else {
+                continue;
+            };
+            if pin8.len() != 8 || !pin8.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+                continue;
+            }
+            let pack = read_pack(&opts.packs.join(name), pubkey_hex)
+                .with_context(|| format!("pack {name}"))?;
+            if pack.manifest.slug != slug {
+                bail!(
+                    "{name}: pack.json names slug '{}', not '{slug}'",
+                    pack.manifest.slug
+                );
+            }
+            if !pack.manifest.pin_sha.starts_with(pin8) {
+                bail!(
+                    "{name}: pack.json pin {} does not start with the file's {pin8}",
+                    pack.manifest.pin_sha
+                );
+            }
+            used.insert(name.clone());
+            let newer = match &best {
+                Some((_, b)) => pack.manifest.built_at > b.manifest.built_at,
+                None => true,
+            };
+            if newer {
+                best = Some((name.clone(), pack));
+            }
+        }
+        let Some((file, pack)) = best else {
+            without_pack.push(slug.to_string());
+            continue;
+        };
+        if pack.manifest.licence_class == LicenceClass::Excluded {
+            // Plan §12.1: an excluded licence gets no listing.
+            continue;
+        }
+        let pin8 = &pack.manifest.pin_sha[..8];
+        let ask_for = field("domain").trim().to_string();
+        let topics: Vec<String> = row
+            .pointer("/tags/topics")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut terms: Vec<String> = Vec::new();
+        let mut push = |t: &str| {
+            if !t.is_empty() {
+                terms.push(t.to_string());
+                terms.push(t.to_lowercase());
+            }
+        };
+        for d in &pack.defs {
+            push(&d.symbol);
+        }
+        for f in &pack.files {
+            for comp in f.path.split('/') {
+                push(strip_extension(comp));
+            }
+        }
+        for text in std::iter::once(ask_for.as_str()).chain(topics.iter().map(String::as_str)) {
+            terms.extend(words(text));
+        }
+        let tag = opts
+            .tags
+            .get(&(slug.to_string(), pin8.to_string()))
+            .cloned()
+            .unwrap_or_else(|| format!("pack-{slug}-{pin8}"));
+        let pack_url = format!("{}/{tag}/{file}", opts.release_base.trim_end_matches('/'));
+        out.push(CatalogueEntry {
+            slug: slug.to_string(),
+            domain: field("cat").to_string(),
+            topics,
+            ask_for,
+            pin_sha: pack.manifest.pin_sha.clone(),
+            pin_date: pack.manifest.pin_date.clone(),
+            refresh_cadence_days: cadence_days(field("refresh")),
+            licence_spdx: pack.manifest.licence_spdx.clone(),
+            licence_class: pack.manifest.licence_class,
+            pack_bytes: pack.bytes,
+            sig_url: format!("{pack_url}.sig"),
+            pack_url,
+            pack_sha256: pack.sha256,
+            dependency_names: Vec::new(),
+            quality_grade: None,
+            term_sketch: crate::sketch::build(terms),
+        });
+    }
+    Ok(out)
 }
 
 /// The members of a verified pack the catalogue needs.
@@ -623,6 +765,130 @@ mod tests {
         assert!(built.unmatched.is_empty());
         verify_bytes(&built.bytes, &built.sig_hex, &public).unwrap();
         assert_eq!(built.bytes, canonical_json(&built.catalogue).unwrap());
+    }
+
+    /// Adds a live lane-B record corpus `rv` to the fixture's backlog and writes
+    /// a signed record hubpack for it per `(pin, built_at)`.
+    fn add_record_corpus(opts: &Options, seed: &str, packs: &[(&str, &str)]) {
+        let mut backlog: Value =
+            serde_json::from_str(&fs::read_to_string(&opts.backlog).unwrap()).unwrap();
+        backlog["corpora"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "slug": "rv", "status": "live", "lane": "B", "cat": "SEC", "refresh": "daily",
+                "domain": "an agent reviewing Rust code queries this for vulnerability precedent",
+                "tags": { "topics": ["vulnerabilities"] }
+            }));
+        fs::write(&opts.backlog, backlog.to_string()).unwrap();
+        let snap = opts.packs.parent().unwrap().join("snap");
+        for (pin, built_at) in packs {
+            let mut m = manifest("rv", pin);
+            m.built_at = built_at.to_string();
+            m.licence_spdx = "CC0-1.0".into();
+            let defs = vec![DefRecord {
+                symbol: format!("RUSTSEC-{}", &pin[..4]),
+                kind: "record".into(),
+                lang: String::new(),
+                file: "rustsec/records.jsonl".into(),
+                line: 1,
+                text: "x".into(),
+                value: None,
+            }];
+            let files = vec![PackFileEntry {
+                path: "rustsec/records.jsonl".into(),
+                lang: String::new(),
+                bytes: 10,
+                licence: "CC0-1.0".into(),
+            }];
+            write_pack(
+                &opts.packs.join(format!("rv-{}.hubpack.tar.zst", &pin[..8])),
+                &m,
+                &defs,
+                &files,
+                &snap,
+                seed,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_live_record_corpus_is_listed_at_its_newest_verified_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (seed, public) = generate_keypair().unwrap();
+        let opts = fixture(tmp.path(), &seed);
+        let old = "1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa";
+        let new = "2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb";
+        add_record_corpus(
+            &opts,
+            &seed,
+            &[(old, "2026-10-16T04:30:00Z"), (new, "2026-10-17T04:30:00Z")],
+        );
+        let built = build(&opts, &seed, &public).unwrap();
+        let slugs: Vec<&str> = built
+            .catalogue
+            .corpora
+            .iter()
+            .map(|e| e.slug.as_str())
+            .collect();
+        assert_eq!(slugs, ["lz4", "rv"], "sorted, both lanes");
+        let e = &built.catalogue.corpora[1];
+        assert_eq!(e.pin_sha, new);
+        assert_eq!(
+            e.pack_url,
+            "https://github.com/xerj-org/xerj/releases/download/pack-rv-2222bbbb/rv-2222bbbb.hubpack.tar.zst"
+        );
+        assert_eq!(e.domain, "SEC");
+        assert_eq!(e.refresh_cadence_days, 1);
+        assert_eq!(e.topics, ["vulnerabilities"]);
+        assert!(e.ask_for.contains("vulnerability precedent"));
+        assert_eq!(e.licence_spdx, "CC0-1.0");
+        assert_eq!(e.quality_grade, None);
+        assert!(sketch::contains(&e.term_sketch, "RUSTSEC-2222"));
+        assert!(sketch::contains(&e.term_sketch, "rustsec"));
+        assert!(built.unmatched.is_empty(), "{:?}", built.unmatched);
+        // The signature covers the merged list.
+        verify_bytes(&built.bytes, &built.sig_hex, &public).unwrap();
+        assert_eq!(built.bytes, canonical_json(&built.catalogue).unwrap());
+    }
+
+    #[test]
+    fn a_record_pack_whose_pin_disagrees_with_its_file_name_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (seed, public) = generate_keypair().unwrap();
+        let opts = fixture(tmp.path(), &seed);
+        add_record_corpus(
+            &opts,
+            &seed,
+            &[("3333cccc3333cccc3333cccc3333cccc3333cccc", "x")],
+        );
+        fs::rename(
+            opts.packs.join("rv-3333cccc.hubpack.tar.zst"),
+            opts.packs.join("rv-4444dddd.hubpack.tar.zst"),
+        )
+        .unwrap();
+        fs::rename(
+            opts.packs.join("rv-3333cccc.hubpack.tar.zst.sig"),
+            opts.packs.join("rv-4444dddd.hubpack.tar.zst.sig"),
+        )
+        .unwrap();
+        let err = format!("{:#}", build(&opts, &seed, &public).err().unwrap());
+        assert!(
+            err.contains("does not start with the file's 4444dddd"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_live_record_corpus_without_a_pack_is_reported_not_invented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (seed, public) = generate_keypair().unwrap();
+        let opts = fixture(tmp.path(), &seed);
+        add_record_corpus(&opts, &seed, &[]);
+        let built = build(&opts, &seed, &public).unwrap();
+        assert_eq!(built.catalogue.corpora.len(), 1);
+        assert_eq!(built.without_pack, ["zstd", "rv"]);
     }
 
     #[test]

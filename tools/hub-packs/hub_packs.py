@@ -29,6 +29,11 @@ Registry facts this relies on (tools/xerj-code/hub/):
     (A = git manifest, B = harvested pack recipe) and `refresh`
     (pinned|weekly|daily).  Only live lane-A rows have a manifest this pipeline
     can build.
+  * Live lane-B rows are RECORD packs (rust-vulns, agent-session-trajectories):
+    pack-publish.yml builds them as hubpacks (`xerj hub build-pack --from-pack`)
+    under the same `pack-<slug>-<pin8>` release names, with a CONTENT pin (no
+    commit exists), so `fetch-list` and `check-catalogue` take their pin from
+    the releases and the catalogue rather than from a manifest.
 """
 
 from __future__ import annotations
@@ -554,11 +559,45 @@ def fetch_list(corpora: list[Corpus], published_tags: Iterable[str]) -> list[tup
     return out
 
 
+def load_record_slugs(backlog: pathlib.Path) -> list[str]:
+    """Live lane-B corpora: the record packs pack-publish.yml builds as hubpacks."""
+    rows = json.loads(backlog.read_text()).get("corpora", [])
+    return sorted(
+        r["slug"]
+        for r in rows
+        if r.get("status") == "live" and r.get("lane") == "B" and SLUG_RE.match(str(r.get("slug", "")))
+    )
+
+
+def record_fetch_list(
+    slugs: Iterable[str],
+    published_tags: Iterable[str],
+    published_at: Optional[dict[str, str]] = None,
+) -> list[tuple[str, str, str]]:
+    """`(slug, pin8, tag)` for the record packs' hubpack releases.  A record pack's
+    pin is a content pin, so no manifest names the current one: with
+    `published_at` (tag -> ISO time) only the most recently published pin of each
+    slug is listed, otherwise every published pin (build-catalogue then lists the
+    newest `built_at`).  The pack-publish JSON releases (`pack-<slug>-<date>`) never
+    match: a pin8 is 8 hex digits."""
+    tags = list(published_tags)
+    out = []
+    for slug in slugs:
+        rx = re.compile(re.escape(f"pack-{slug}-") + r"([0-9a-f]{8})(?:-r\d+)?")
+        pins = sorted({m.group(1) for t in tags if (m := rx.fullmatch(t))})
+        rows = [(slug, pin8, released_tag(tags, slug, pin8)) for pin8 in pins]
+        if published_at is not None and rows:
+            rows = [max(rows, key=lambda r: (published_at.get(r[2] or "", ""), r[1]))]
+        out.extend((s_, p, t) for s_, p, t in rows if t)
+    return out
+
+
 def check_catalogue(
     raw: bytes,
     corpora: list[Corpus],
     repo: str,
     previous: Optional[bytes] = None,
+    record_slugs: Iterable[str] = (),
 ) -> list[str]:
     """Everything that must hold before a freshly built catalogue replaces the live
     one; the list of violations (empty = fine).
@@ -582,26 +621,35 @@ def check_catalogue(
         return [*errors, "no corpora"]
 
     live = {c.slug: c for c in corpora}
+    records = set(record_slugs)
     listed: set[str] = set()
     for e in entries:
         slug = e.get("slug", "")
         c = live.get(slug)
-        if c is None:
+        if c is None and slug not in records:
             errors.append(f"{slug or '?'}: not a live lane-A corpus in the registry")
             continue
         if slug in listed:
             errors.append(f"{slug}: listed twice")
         listed.add(slug)
-        if e.get("pin_sha") != c.pin_sha:
-            errors.append(f"{slug}: pin_sha {str(e.get('pin_sha'))[:12]} is not the manifest's {c.pin8}")
+        if c is not None:
+            pin8 = c.pin8
+            if e.get("pin_sha") != c.pin_sha:
+                errors.append(f"{slug}: pin_sha {str(e.get('pin_sha'))[:12]} is not the manifest's {c.pin8}")
+        else:
+            # A record pack: its content pin is whatever the signed pack says, but
+            # it must have the shape of a pin and its URL must name that pin.
+            pin8 = str(e.get("pin_sha", ""))[:8]
+            if not SHA_RE.match(str(e.get("pin_sha", ""))):
+                errors.append(f"{slug}: pin_sha {str(e.get('pin_sha'))[:12]!r} is not 40 hex")
         url = e.get("pack_url", "")
         want = (
             r"^https://github\.com/" + re.escape(repo) + r"/releases/download/"
-            + re.escape(pack_tag(slug, c.pin8)) + r"(?:-r\d+)?/"
-            + re.escape(f"{slug}-{c.pin8}.hubpack.tar.zst") + "$"
+            + re.escape(pack_tag(slug, pin8)) + r"(?:-r\d+)?/"
+            + re.escape(f"{slug}-{pin8}.hubpack.tar.zst") + "$"
         )
         if not re.match(want, url):
-            errors.append(f"{slug}: pack_url {url!r} is not the release asset of pin {c.pin8}")
+            errors.append(f"{slug}: pack_url {url!r} is not the release asset of pin {pin8}")
         if e.get("sig_url") != url + ".sig":
             errors.append(f"{slug}: sig_url is not pack_url + '.sig'")
         if not re.fullmatch(r"[0-9a-f]{64}", str(e.get("pack_sha256", ""))):
@@ -624,7 +672,7 @@ def check_catalogue(
         if before_list is None or not all(isinstance(x, dict) for x in before_list):
             return [*errors, "the previous (live) catalogue is not a catalogue; cannot tell which corpora it lists"]
         before = {x.get("slug") for x in before_list}
-        for slug in sorted((before & set(live)) - listed):
+        for slug in sorted((before & (set(live) | records)) - listed):
             errors.append(f"{slug}: in the live catalogue and still live, but missing from the new one")
     return errors
 
@@ -856,7 +904,17 @@ def cmd_fetch_list(a: argparse.Namespace) -> int:
     tags = pathlib.Path(a.published_tags).read_text().split()
     rows = fetch_list(corpora, tags)
     print(f"fetch-list: {len(rows)} of {len(corpora)} live corpora have a published pack", file=sys.stderr)
-    for slug, pin8, tag in rows:
+    published_at = None
+    if a.published_at:
+        published_at = {}
+        for line in pathlib.Path(a.published_at).read_text().splitlines():
+            tag, _, when = line.partition("\t")
+            if tag.strip():
+                published_at[tag.strip()] = when.strip()
+    records = load_record_slugs(pathlib.Path(a.backlog))
+    rec_rows = record_fetch_list(records, tags, published_at)
+    print(f"fetch-list: {len(rec_rows)} record-pack release(s) for {len(records)} live record corpora", file=sys.stderr)
+    for slug, pin8, tag in rows + rec_rows:
         print(f"{slug}\t{pin8}\t{tag}")
     return 0
 
@@ -865,7 +923,8 @@ def cmd_check_catalogue(a: argparse.Namespace) -> int:
     corpora, _ = load_live(pathlib.Path(a.registry), pathlib.Path(a.backlog))
     raw = pathlib.Path(a.catalogue).read_bytes()
     previous = pathlib.Path(a.previous).read_bytes() if a.previous else None
-    errors = check_catalogue(raw, corpora, a.repo, previous)
+    records = load_record_slugs(pathlib.Path(a.backlog))
+    errors = check_catalogue(raw, corpora, a.repo, previous, records)
     if a.allow_drops:
         errors = [e for e in errors if "missing from the new one" not in e]
     for e in errors:
@@ -975,6 +1034,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     f.add_argument("--registry", required=True)
     f.add_argument("--backlog", required=True)
     f.add_argument("--published-tags", required=True)
+    f.add_argument(
+        "--published-at",
+        help="tag<TAB>published-at lines; list only each record pack's newest pin",
+    )
     f.set_defaults(fn=cmd_fetch_list)
 
     k = sub.add_parser("check-catalogue", help="refuse a catalogue that disagrees with the registry")
