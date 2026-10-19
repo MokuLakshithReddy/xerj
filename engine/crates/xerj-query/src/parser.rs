@@ -2483,6 +2483,246 @@ fn parse_match_phrase_prefix(params: &Value) -> Result<QueryNode> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum SqsTok {
+    Term(String),
+    Phrase(String),
+    And,    // `+`
+    Or,     // `|`
+    Not,    // `-`
+    LParen, // `(`
+    RParen, // `)`
+}
+
+fn unescape_sqs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(nxt) = chars.next() {
+                out.push(nxt);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn tokenize_simple_query_string(q: &str) -> Vec<SqsTok> {
+    let bytes = q.as_bytes();
+    let mut out: Vec<SqsTok> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '(' {
+            out.push(SqsTok::LParen);
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            out.push(SqsTok::RParen);
+            i += 1;
+            continue;
+        }
+        if c == '|' {
+            i += 1;
+            if i < bytes.len() && bytes[i] as char == '|' {
+                i += 1;
+            }
+            out.push(SqsTok::Or);
+            continue;
+        }
+        if c == '+' {
+            out.push(SqsTok::And);
+            i += 1;
+            continue;
+        }
+        if c == '-' {
+            out.push(SqsTok::Not);
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() {
+                if bytes[j] as char == '\\' && j + 1 < bytes.len() {
+                    j += 2;
+                } else if bytes[j] as char == '"' {
+                    break;
+                } else {
+                    j += 1;
+                }
+            }
+            let phrase = unescape_sqs(&q[start..j]);
+            if !phrase.is_empty() {
+                out.push(SqsTok::Phrase(phrase));
+            }
+            if j < bytes.len() && bytes[j] as char == '"' {
+                i = j + 1;
+            } else {
+                i = j;
+            }
+            continue;
+        }
+
+        // Bare term: read until whitespace, '(', ')', '|', or '"'
+        // NOTE: '+' or '-' inside a term (e.g. "c++", "node-fetch", "2024-05-01")
+        // is part of the term, so we do not stop on '+' or '-' mid-term.
+        let start = i;
+        while i < bytes.len() {
+            let ch = bytes[i] as char;
+            if ch.is_ascii_whitespace() || ch == '(' || ch == ')' || ch == '|' || ch == '"' {
+                break;
+            }
+            if ch == '\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        let tok = unescape_sqs(&q[start..i]);
+        if !tok.is_empty() {
+            out.push(SqsTok::Term(tok));
+        }
+    }
+    out
+}
+
+fn parse_sqs_unary(
+    toks: &[SqsTok],
+    pos: &mut usize,
+    fields: &[String],
+    lenient: bool,
+    default_and: bool,
+) -> Option<QueryNode> {
+    while *pos < toks.len() {
+        match &toks[*pos] {
+            SqsTok::LParen => {
+                *pos += 1;
+                let _depth_guard = DepthGuard::enter().ok()?;
+                let inner = parse_sqs_level(toks, pos, fields, lenient, default_and);
+                if *pos < toks.len() && matches!(toks[*pos], SqsTok::RParen) {
+                    *pos += 1;
+                }
+                return inner;
+            }
+            SqsTok::RParen => {
+                *pos += 1;
+            }
+            SqsTok::Term(term) => {
+                *pos += 1;
+                return Some(make_simple_query_node(term, false, fields, lenient));
+            }
+            SqsTok::Phrase(phrase) => {
+                *pos += 1;
+                return Some(make_simple_query_node(phrase, true, fields, lenient));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn parse_sqs_level(
+    toks: &[SqsTok],
+    pos: &mut usize,
+    fields: &[String],
+    lenient: bool,
+    default_and: bool,
+) -> Option<QueryNode> {
+    let mut clauses: Vec<(QsOccur, QueryNode)> = Vec::new();
+
+    while *pos < toks.len() && !matches!(toks[*pos], SqsTok::RParen) {
+        let mut conj = QsConj::None;
+        let mut req_mod = false;
+        let mut not_mod = false;
+
+        while let Some(t) = toks.get(*pos) {
+            match t {
+                SqsTok::And => {
+                    if clauses.is_empty() || conj != QsConj::None {
+                        req_mod = true;
+                    } else {
+                        conj = QsConj::And;
+                    }
+                }
+                SqsTok::Or => {
+                    conj = QsConj::Or;
+                }
+                SqsTok::Not => {
+                    not_mod = true;
+                }
+                _ => break,
+            }
+            *pos += 1;
+        }
+
+        if *pos >= toks.len() || matches!(toks[*pos], SqsTok::RParen) {
+            break;
+        }
+
+        let Some(node) = parse_sqs_unary(toks, pos, fields, lenient, default_and) else {
+            continue;
+        };
+
+        if let Some(prev) = clauses.last_mut() {
+            if prev.0 != QsOccur::MustNot {
+                if conj == QsConj::And {
+                    prev.0 = QsOccur::Must;
+                } else if conj == QsConj::Or && default_and {
+                    prev.0 = QsOccur::Should;
+                }
+            }
+        }
+
+        let required = if default_and {
+            !not_mod && conj != QsConj::Or
+        } else {
+            req_mod || (conj == QsConj::And && !not_mod)
+        };
+
+        let occur = if not_mod {
+            QsOccur::MustNot
+        } else if required {
+            QsOccur::Must
+        } else {
+            QsOccur::Should
+        };
+
+        clauses.push((occur, node));
+    }
+
+    if clauses.is_empty() {
+        return None;
+    }
+
+    let (mut must, mut should, mut must_not) = (Vec::new(), Vec::new(), Vec::new());
+    for (occur, node) in clauses {
+        match occur {
+            QsOccur::Must => must.push(node),
+            QsOccur::Should => should.push(node),
+            QsOccur::MustNot => must_not.push(node),
+        }
+    }
+
+    let minimum_should_match =
+        (must.is_empty() && !should.is_empty()).then_some(MinShouldMatch::Fixed(1));
+
+    Some(QueryNode::Bool {
+        must,
+        should,
+        must_not,
+        filter: Vec::new(),
+        minimum_should_match,
+    })
+}
+
 fn parse_simple_query_string(params: &Value) -> Result<QueryNode> {
     let obj = params
         .as_object()
@@ -2509,72 +2749,79 @@ fn parse_simple_query_string(params: &Value) -> Result<QueryNode> {
         .unwrap_or("or")
         .to_lowercase();
 
+    let default_and = default_operator == "and";
+
     let mm: Option<MinShouldMatch> = obj
         .get("minimum_should_match")
         .and_then(|v| parse_min_should_match(v).ok());
     // #1284: same default as `multi_match` / `query_string`.
     let lenient = parse_lenient(obj.get("lenient")).unwrap_or_else(|| targets_every_field(&fields));
 
-    // Tokenize the query: split on whitespace; leading +/-/| signal per-term operators.
-    let mut must: Vec<QueryNode> = Vec::new();
-    let mut should: Vec<QueryNode> = Vec::new();
-    let mut must_not: Vec<QueryNode> = Vec::new();
+    let toks = tokenize_simple_query_string(&query);
+    let mut pos = 0;
+    let parsed = parse_sqs_level(&toks, &mut pos, &fields, lenient, default_and);
 
-    for tok in query.split_whitespace() {
-        // Detect a leading per-term sign.
-        let (sign, term_text) = if let Some(rest) = tok.strip_prefix('+') {
-            ('+', rest)
-        } else if let Some(rest) = tok.strip_prefix('-') {
-            ('-', rest)
-        } else if let Some(rest) = tok.strip_prefix('|') {
-            ('|', rest)
-        } else {
-            (' ', tok)
-        };
-        if term_text.is_empty() {
-            continue;
-        }
-        let node = make_simple_query_node(term_text, &fields, lenient);
-        match sign {
-            '+' => must.push(node),
-            '-' => must_not.push(node),
-            '|' => should.push(node),
-            _ => {
-                // Unsigned token: dispatched per default_operator.
-                if default_operator == "and" {
-                    must.push(node);
-                } else {
-                    should.push(node);
-                }
+    let node = match parsed {
+        Some(QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            minimum_should_match: auto_mm,
+        }) => {
+            let final_mm = if mm.is_some() {
+                mm
+            } else {
+                auto_mm
+            };
+            QueryNode::Bool {
+                must,
+                should,
+                must_not,
+                filter,
+                minimum_should_match: final_mm,
             }
         }
-    }
-
-    // No tokens parsed (rare empty query): treat query as a literal term.
-    if must.is_empty() && should.is_empty() && must_not.is_empty() {
-        let node = make_simple_query_node(&query, &fields, lenient);
-        return Ok(node);
-    }
-
-    let final_mm = if !should.is_empty() && must.is_empty() && mm.is_none() {
-        // Default: at least 1 should clause must match.
-        Some(MinShouldMatch::Fixed(1))
-    } else {
-        mm
+        Some(other) => other,
+        None => make_simple_query_node(&query, false, &fields, lenient),
     };
 
-    Ok(QueryNode::Bool {
-        must,
-        should,
-        must_not,
-        filter: Vec::new(),
-        minimum_should_match: final_mm,
-    })
+    Ok(node)
 }
 
-/// Build a Match or MultiMatch node for a term in a simple_query_string.
-fn make_simple_query_node(term: &str, fields: &[String], lenient: bool) -> QueryNode {
-    if fields.len() == 1 {
+/// Build a Match, MatchPhrase, or MultiMatch node for a term in a simple_query_string.
+fn make_simple_query_node(term: &str, is_phrase: bool, fields: &[String], lenient: bool) -> QueryNode {
+    if is_phrase {
+        if fields.len() == 1 {
+            QueryNode::MatchPhrase {
+                field: fields[0].clone(),
+                query: term.to_string(),
+                slop: 0,
+                analyzer: None,
+                boost: None,
+                lenient,
+            }
+        } else if fields.is_empty() {
+            QueryNode::QueryString {
+                query: format!("\"{}\"", term),
+                default_field: None,
+                default_operator: None,
+                boost: None,
+            }
+        } else {
+            QueryNode::MultiMatch {
+                fields: fields.to_vec(),
+                query: term.to_string(),
+                match_type: crate::ast::MultiMatchType::Phrase,
+                operator: None,
+                analyzer: None,
+                boost: None,
+                slop: 0,
+                max_expansions: 50,
+                lenient,
+            }
+        }
+    } else if fields.len() == 1 {
         QueryNode::Match {
             field: fields[0].clone(),
             query: term.to_string(),
@@ -6850,5 +7097,98 @@ mod tests {
                 "`{name}` must refuse with an explanatory message, got: {err}"
             );
         }
+    }
+
+    // ── #1751: simple_query_string standalone and infix operators ──────────────
+
+    #[test]
+    fn simple_query_string_honors_operators_grouping_and_phrases() {
+        // `fox | bear` under `default_operator: and` must be OR (should clauses).
+        let node = q(json!({
+            "simple_query_string": {
+                "query": "fox | bear",
+                "fields": ["title"],
+                "default_operator": "and"
+            }
+        }));
+        match node {
+            QueryNode::Bool { should, must, minimum_should_match, .. } => {
+                assert!(must.is_empty(), "must be empty under OR conjunction: {must:?}");
+                assert_eq!(should.len(), 2);
+                assert_eq!(minimum_should_match, Some(MinShouldMatch::Fixed(1)));
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+
+        // `fox + lazy` under default operator must be AND (must clauses).
+        let node = q(json!({
+            "simple_query_string": {
+                "query": "fox + lazy",
+                "fields": ["title"]
+            }
+        }));
+        match node {
+            QueryNode::Bool { must, should, .. } => {
+                assert_eq!(must.len(), 2, "both terms must be required: {must:?}");
+                assert!(should.is_empty());
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+
+        // `"quick brown" | bear` under `default_operator: and` must produce MatchPhrase and Match in should.
+        let node = q(json!({
+            "simple_query_string": {
+                "query": "\"quick brown\" | bear",
+                "fields": ["title"],
+                "default_operator": "and"
+            }
+        }));
+        match node {
+            QueryNode::Bool { should, must, .. } => {
+                assert!(must.is_empty());
+                assert_eq!(should.len(), 2);
+                assert!(matches!(&should[0], QueryNode::MatchPhrase { ref query, .. } if query == "quick brown"));
+                assert!(matches!(&should[1], QueryNode::Match { ref query, .. } if query == "bear"));
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+
+        // `(fox | bear) + brown` under `default_operator: and` must group (fox | bear) and require brown.
+        let node = q(json!({
+            "simple_query_string": {
+                "query": "(fox | bear) + brown",
+                "fields": ["title"],
+                "default_operator": "and"
+            }
+        }));
+        match node {
+            QueryNode::Bool { must, .. } => {
+                assert_eq!(must.len(), 2);
+                assert!(matches!(&must[0], QueryNode::Bool { ref should, .. } if should.len() == 2));
+                assert!(matches!(&must[1], QueryNode::Match { ref query, .. } if query == "brown"));
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+
+        // Negation with `-`
+        let node = q(json!({
+            "simple_query_string": {
+                "query": "+fox -dog",
+                "fields": ["title"]
+            }
+        }));
+        match node {
+            QueryNode::Bool { must, must_not, .. } => {
+                assert_eq!(must.len(), 1);
+                assert_eq!(must_not.len(), 1);
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+
+        // Resilient to trailing/standalone operators and unclosed quotes/parens
+        let _ = q(json!({ "simple_query_string": { "query": "fox |" } }));
+        let _ = q(json!({ "simple_query_string": { "query": "(fox | bear" } }));
+        let _ = q(json!({ "simple_query_string": { "query": "\"unclosed phrase" } }));
+        let _ = q(json!({ "simple_query_string": { "query": "++ -- ||" } }));
     }
 }
